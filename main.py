@@ -1,116 +1,147 @@
+# main.py
+"""
+PURGE / RESET SCRIPT (run once)
+
+What this does:
+- Logs in as your bot
+- Deletes ALL GLOBAL application commands for the bot
+- Deletes ALL GUILD (server) application commands for the bot (for one or more guilds you specify)
+- Optionally syncs an empty command tree to those guilds (fast)
+- Exits cleanly
+
+How to run:
+1) Set env var DISCORD_TOKEN
+2) Set env var GUILD_IDS (recommended) as comma-separated IDs, e.g.:
+   GUILD_IDS=1324470539506548766
+   or
+   GUILD_IDS=1324470539506548766,123456789012345678
+3) Deploy/run once. Watch logs for "PURGE COMPLETE", then replace main.py with your real bot.
+
+Will this delete/purge old commands?
+✅ Yes, for BOTH global and the guild(s) you list.
+
+Does it have to stay in the code permanently?
+❌ No. Use it once, then remove/replace.
+"""
+
 import os
-import logging
 import asyncio
+import logging
+from typing import List, Optional
+
 import discord
 from discord import app_commands
 
-# -----------------------------
-# Logging
-# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-LOG = logging.getLogger("CommandPurger")
+log = logging.getLogger("CommandPurger")
 
-# -----------------------------
-# Env helpers
-# -----------------------------
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
-def _env_str(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-# -----------------------------
-# Config
-# -----------------------------
-DISCORD_TOKEN = _env_str("DISCORD_TOKEN")
-GUILD_ID_STR = _env_str("GUILD_ID")  # your server ID (recommended)
-PURGE = _env_bool("PURGE_COMMANDS", True)
-
-# PURGE_SCOPE can be: "guild", "global", "both"
-PURGE_SCOPE = _env_str("PURGE_SCOPE", "guild").lower()
-
-# After purging, exit the process (recommended)
-EXIT_AFTER_PURGE = _env_bool("EXIT_AFTER_PURGE", True)
-
-# -----------------------------
-# Discord Client
-# -----------------------------
-intents = discord.Intents.none()  # no privileged intents needed for command sync
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-@client.event
-async def on_ready():
-    LOG.info("Logged in as %s (ID: %s)", client.user, client.user.id)
-
-async def purge_guild_commands(guild_id: int) -> int:
-    """Clear and sync commands scoped to a specific guild."""
-    guild = discord.Object(id=guild_id)
-    tree.clear_commands(guild=guild)
-    synced = await tree.sync(guild=guild)
-    # When clearing, sync() returns the currently registered commands after sync.
-    # After a clear, this should be 0.
-    return len(synced)
-
-async def purge_global_commands() -> int:
-    """Clear and sync global commands."""
-    tree.clear_commands(guild=None)
-    synced = await tree.sync()
-    return len(synced)
-
-async def do_purge():
-    if not PURGE:
-        LOG.info("PURGE_COMMANDS is disabled. Nothing to do.")
-        return
-
-    guild_id = int(GUILD_ID_STR) if GUILD_ID_STR.isdigit() else None
-
-    if PURGE_SCOPE not in ("guild", "global", "both"):
-        raise ValueError("PURGE_SCOPE must be one of: guild, global, both")
-
-    if PURGE_SCOPE in ("guild", "both"):
-        if guild_id is None:
-            raise RuntimeError("PURGE_SCOPE includes 'guild' but GUILD_ID is not set or invalid.")
-        LOG.info("Purging GUILD commands for guild_id=%s ...", guild_id)
-        count = await purge_guild_commands(guild_id)
-        LOG.info("Guild purge complete. Commands now registered in guild: %s", count)
-
-    if PURGE_SCOPE in ("global", "both"):
-        LOG.info("Purging GLOBAL commands ...")
-        count = await purge_global_commands()
-        LOG.info("Global purge complete. Commands now registered globally: %s", count)
-
-    LOG.info("✅ Purge finished.")
-
-class PurgeBot(discord.Client):
-    async def setup_hook(self) -> None:
-        # Run purge as early as possible after login handshake begins.
-        # setup_hook is awaited by discord.py before on_ready.
+def _parse_guild_ids(raw: Optional[str]) -> List[int]:
+    if not raw:
+        return []
+    out: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
         try:
-            await do_purge()
-        except Exception as e:
-            LOG.exception("❌ Purge failed: %s", e)
-        finally:
-            if EXIT_AFTER_PURGE:
-                LOG.info("Exiting after purge (EXIT_AFTER_PURGE=True).")
-                # Close the client cleanly and stop the process.
-                await self.close()
+            out.append(int(part))
+        except ValueError:
+            raise SystemExit(f"Invalid GUILD_IDS entry: {part!r} (must be integer IDs)")
+    return out
 
-# Replace the base client with PurgeBot instance
-client = PurgeBot(intents=intents)
-tree = app_commands.CommandTree(client)
 
-def main():
-    if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN is missing.")
-    LOG.info("Starting Command Purger with PURGE_SCOPE=%s, EXIT_AFTER_PURGE=%s", PURGE_SCOPE, EXIT_AFTER_PURGE)
-    client.run(DISCORD_TOKEN)
+class PurgeClient(discord.Client):
+    def __init__(self):
+        # No privileged intents required for command deletion.
+        intents = discord.Intents.none()
+        super().__init__(intents=intents)
+
+        # Even though we won't be using the command tree to register commands,
+        # having a tree attached is useful for syncing an empty set.
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self) -> None:
+        # Called before on_ready; good place to do app-command operations.
+        await self._purge_commands_then_exit()
+
+    async def _purge_commands_then_exit(self) -> None:
+        token_present = bool(os.getenv("DISCORD_TOKEN"))
+        if not token_present:
+            raise SystemExit("Missing env var DISCORD_TOKEN")
+
+        guild_ids = _parse_guild_ids(os.getenv("GUILD_IDS"))
+
+        # Ensure we have an application ID available
+        app_info = await self.application_info()
+        log.info("Logged in application: %s (ID: %s)", app_info.name, app_info.id)
+
+        # 1) Delete GLOBAL commands
+        try:
+            global_cmds = await self.http.get_global_commands(app_info.id)
+            log.info("Found %d global commands", len(global_cmds))
+            deleted = 0
+            for cmd in global_cmds:
+                cmd_id = cmd.get("id")
+                cmd_name = cmd.get("name")
+                if not cmd_id:
+                    continue
+                await self.http.delete_global_command(app_info.id, cmd_id)
+                deleted += 1
+                log.info("Deleted global command: %s (ID: %s)", cmd_name, cmd_id)
+            log.info("Deleted %d global commands", deleted)
+        except Exception:
+            log.exception("Failed while deleting global commands")
+            # Continue; we still want to attempt guild purge.
+
+        # 2) Delete GUILD commands (recommended because they disappear quickly)
+        if not guild_ids:
+            log.warning(
+                "No GUILD_IDS provided. Guild commands will NOT be purged.\n"
+                "Set env var GUILD_IDS to your server ID(s) for a complete wipe."
+            )
+        else:
+            for gid in guild_ids:
+                try:
+                    guild_cmds = await self.http.get_guild_commands(app_info.id, gid)
+                    log.info("Guild %s: found %d commands", gid, len(guild_cmds))
+                    deleted = 0
+                    for cmd in guild_cmds:
+                        cmd_id = cmd.get("id")
+                        cmd_name = cmd.get("name")
+                        if not cmd_id:
+                            continue
+                        await self.http.delete_guild_command(app_info.id, gid, cmd_id)
+                        deleted += 1
+                        log.info("Guild %s: deleted command %s (ID: %s)", gid, cmd_name, cmd_id)
+                    log.info("Guild %s: deleted %d commands", gid, deleted)
+
+                    # 3) Sync EMPTY tree to the guild to force immediate "no commands"
+                    # Clear any accidental commands in the local tree (should be empty anyway)
+                    self.tree.clear_commands(guild=discord.Object(id=gid))
+                    synced = await self.tree.sync(guild=discord.Object(id=gid))
+                    log.info("Guild %s: synced empty tree (%d commands)", gid, len(synced))
+
+                except Exception:
+                    log.exception("Guild %s: failed during purge/sync", gid)
+
+        log.info("✅ PURGE COMPLETE. Shutting down now.")
+        await self.close()
+
+
+def main() -> None:
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit("Missing env var DISCORD_TOKEN")
+
+    # Optional: GUILD_IDS=comma,separated,ids
+    # If you only have one server, set it to that server's ID.
+    client = PurgeClient()
+    client.run(token, log_handler=None)
+
 
 if __name__ == "__main__":
     main()
