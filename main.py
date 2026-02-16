@@ -667,93 +667,161 @@ class Database:
         await self._execute(sql, params)
 
 
-async def upgrade_ability(
-    self,
-    guild_id: int,
-    user_id: int,
-    name: str,
-    ability_name: str,
-    upgrades: int,
-    pay_positive: int,
-    pay_negative: int,
-) -> Tuple[int, int]:
-    """Apply ability upgrades (max 5 per ability). Each upgrade costs 5 legacy points.
-    Points may be paid using any mix of positive/negative AVAILABLE legacy points, but the caller must specify the split.
-    This method NEVER touches lifetime totals.
-    """
-    ability_name = ability_name.strip()
-    upgrades = max(1, int(upgrades))
-    pay_positive = max(0, int(pay_positive))
-    pay_negative = max(0, int(pay_negative))
+    async def upgrade_ability(
+        self,
+        guild_id: int,
+        user_id: int,
+        name: str,
+        ability_name: str,
+        upgrades: int,
+        pay_positive: int,
+        pay_negative: int,
+    ) -> Tuple[int, int]:
+        """Apply ability upgrades (max 5 per ability). Each upgrade costs 5 legacy points.
+        Points may be paid using any mix of positive/negative AVAILABLE legacy points, but the caller must specify the split.
+        This method NEVER touches lifetime totals.
+        """
+        ability_name = ability_name.strip()
+        upgrades = max(1, int(upgrades))
+        pay_positive = max(0, int(pay_positive))
+        pay_negative = max(0, int(pay_negative))
 
-    if upgrades < 1:
-        raise ValueError("upgrades must be >= 1")
+        if upgrades < 1:
+            raise ValueError("upgrades must be >= 1")
 
-    total_cost = upgrades * MINOR_UPGRADE_COST
-    if pay_positive + pay_negative != total_cost:
-        raise ValueError(f"Payment must equal {total_cost} points total (5 per upgrade).")
+        total_cost = upgrades * MINOR_UPGRADE_COST
+        if pay_positive + pay_negative != total_cost:
+            raise ValueError(f"Payment must equal {total_cost} points total (5 per upgrade).")
 
-    char_col = self._ability_where_char()
-    level_col = self.abilities_level_col
+        char_col = self._ability_where_char()
+        level_col = self.abilities_level_col
 
-    row = await self._fetchone(
-        f"""
-        SELECT COALESCE({level_col}, 0) AS cur_level
-        FROM abilities
-        WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s
-        ORDER BY created_at ASC
-        LIMIT 1;
-        """,
-        (guild_id, user_id, name.strip(), ability_name),
-    )
-    if not row:
-        raise ValueError("Ability not found. Add it first with /add_ability.")
-    cur_level = safe_int(row.get("cur_level"), 0)
-
-    max_level = 5
-    if cur_level >= max_level:
-        raise ValueError(f"Upgrade limit reached ({cur_level}/{max_level}).")
-
-    # Clamp requested upgrades to remaining cap
-    remaining = max_level - cur_level
-    if upgrades > remaining:
-        raise ValueError(f"Only {remaining} upgrade(s) remaining for this ability (max {max_level}).")
-
-    # Validate available pools and deduct ONLY from available points
-    st = await self.get_character_state(guild_id, user_id, name)
-    if st["legacy_plus"] < pay_positive:
-        raise ValueError(f"Not enough available positive points (need {pay_positive}, have {st['legacy_plus']}).")
-    if st["legacy_minus"] < pay_negative:
-        raise ValueError(f"Not enough available negative points (need {pay_negative}, have {st['legacy_minus']}).")
-
-    if pay_positive:
-        await self._execute(
-            "UPDATE characters SET legacy_plus=legacy_plus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
-            (pay_positive, guild_id, user_id, name.strip()),
+        row = await self._fetchone(
+            f"""
+            SELECT COALESCE({level_col}, 0) AS cur_level
+            FROM abilities
+            WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s
+            ORDER BY created_at ASC
+            LIMIT 1;
+            """,
+            (guild_id, user_id, name.strip(), ability_name),
         )
-    if pay_negative:
+        if not row:
+            raise ValueError("Ability not found. Add it first with /add_ability.")
+        cur_level = safe_int(row.get("cur_level"), 0)
+
+        max_level = 5
+        if cur_level >= max_level:
+            raise ValueError(f"Upgrade limit reached ({cur_level}/{max_level}).")
+
+        # Clamp requested upgrades to remaining cap
+        remaining = max_level - cur_level
+        if upgrades > remaining:
+            raise ValueError(f"Only {remaining} upgrade(s) remaining for this ability (max {max_level}).")
+
+        # Validate available pools and deduct ONLY from available points
+        st = await self.get_character_state(guild_id, user_id, name)
+        if st["legacy_plus"] < pay_positive:
+            raise ValueError(f"Not enough available positive points (need {pay_positive}, have {st['legacy_plus']}).")
+        if st["legacy_minus"] < pay_negative:
+            raise ValueError(f"Not enough available negative points (need {pay_negative}, have {st['legacy_minus']}).")
+
+        if pay_positive:
+            await self._execute(
+                "UPDATE characters SET legacy_plus=legacy_plus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (pay_positive, guild_id, user_id, name.strip()),
+            )
+        if pay_negative:
+            await self._execute(
+                "UPDATE characters SET legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (pay_negative, guild_id, user_id, name.strip()),
+            )
+
+        new_level = cur_level + upgrades
+
+        # Update the detected column, and also keep the other column in sync if present
+        sets: List[str] = [f"{level_col}=%s"]
+        params: List[Any] = [new_level]
+
+        if level_col != "upgrade_level" and "upgrade_level" in self.abilities_cols:
+            sets.append("upgrade_level=%s")
+            params.append(new_level)
+        if level_col != "level" and "level" in self.abilities_cols:
+            sets.append("level=%s")
+            params.append(new_level)
+
+        params.extend([guild_id, user_id, name.strip(), ability_name])
+        sql = f"UPDATE abilities SET {', '.join(sets)} WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s;"
+        await self._execute(sql, params)
+        return new_level, max_level
+
+    # -------- Dashboard message tracking --------
+
+    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str]]:
+        """Return (message_ids, content_hash). Falls back gracefully if content_hash column doesn't exist yet."""
+        try:
+            row = await self._fetchone(
+                "SELECT message_ids, content_hash FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                (guild_id, user_id),
+            )
+            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+            h = str(row["content_hash"]) if row and row.get("content_hash") else None
+            return ids, h
+        except psycopg.errors.UndefinedColumn:
+            row = await self._fetchone(
+                "SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                (guild_id, user_id),
+            )
+            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+            return ids, None
+
+    async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
+        ids, _ = await self.get_dashboard_entry(guild_id, user_id)
+        return ids
+
+    async def set_dashboard_message_ids(
+        self,
+        guild_id: int,
+        user_id: int,
+        channel_id: int,
+        ids: List[int],
+        h: Optional[str] = None,
+    ) -> None:
+        """Persist dashboard message IDs (and optional content hash) for a player."""
+        try:
+            await self._execute(
+                """
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                              message_ids=EXCLUDED.message_ids,
+                              content_hash=EXCLUDED.content_hash,
+                              updated_at=NOW();
+                """,
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
+            )
+        except psycopg.errors.UndefinedColumn:
+            # Older schema: no content_hash column yet.
+            await self._execute(
+                """
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                              message_ids=EXCLUDED.message_ids,
+                              updated_at=NOW();
+                """,
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
+            )
+
+    async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
         await self._execute(
-            "UPDATE characters SET legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
-            (pay_negative, guild_id, user_id, name.strip()),
+            "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+            (guild_id, user_id),
         )
 
-    new_level = cur_level + upgrades
 
-    # Update the detected column, and also keep the other column in sync if present
-    sets: List[str] = [f"{level_col}=%s"]
-    params: List[Any] = [new_level]
-
-    if level_col != "upgrade_level" and "upgrade_level" in self.abilities_cols:
-        sets.append("upgrade_level=%s")
-        params.append(new_level)
-    if level_col != "level" and "level" in self.abilities_cols:
-        sets.append("level=%s")
-        params.append(new_level)
-
-    params.extend([guild_id, user_id, name.strip(), ability_name])
-    sql = f"UPDATE abilities SET {', '.join(sets)} WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s;"
-    await self._execute(sql, params)
-    return new_level, max_level
 
     
     # -------- Dashboard message tracking --------
@@ -1283,15 +1351,21 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(refresh_dashboard)
         self.tree.add_command(char_card)
 
+        LOG.info("Command tree prepared: %s command(s); GUILD_ID=%s", len(self.tree.get_commands()), os.getenv("GUILD_ID"))
+
         # Sync commands
         try:
             gid = safe_int(os.getenv("GUILD_ID"), 0)
             if gid:
                 synced = await self.tree.sync(guild=discord.Object(id=gid))
                 LOG.info("Guild sync succeeded: %s commands", len(synced))
+                if len(synced)==0:
+                    LOG.warning("Guild sync returned 0 commands. Check GUILD_ID, bot invite scopes (applications.commands), and that commands are not pending global propagation.")
             else:
                 synced = await self.tree.sync()
                 LOG.info("Global sync succeeded: %s commands", len(synced))
+                if len(synced)==0:
+                    LOG.warning("Global sync returned 0 commands. This can be normal if no changes were detected, but if commands are missing, check bot invite scopes and app command permissions.")
         except Exception:
             LOG.exception("Command sync failed")
 
