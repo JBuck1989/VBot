@@ -17,6 +17,8 @@ from psycopg.rows import dict_row
 DASHBOARD_CHANNEL_ID = 1469879866655768738
 
 PLAYER_SEPARATOR_LINE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+PLAYER_BLOCK_DIVIDER = "════════════════════════════════════"  # visual separator between player posts
 COMMAND_LOG_CHANNEL_ID = 1469879960729817098
 
 GUARDIAN_ROLE_NAME = "Guardian"
@@ -550,7 +552,7 @@ async def render_dashboard_post(
     user_fallback: str,
 ) -> Optional[str]:
     # Pull active characters for user; if none, no dashboard post
-    chars = await interaction.client.db.get_characters_for_user(guild.id, user_id, include_archived=False)
+    chars = await db.get_characters_for_user(guild.id, user_id, include_archived=False)
     if not chars:
         return None
 
@@ -565,7 +567,7 @@ async def render_dashboard_post(
     except Exception:
         pass
 
-    rank = await interaction.client.db.get_rank(guild.id, user_id)
+    rank = await db.get_rank(guild.id, user_id)
 
     out: List[str] = []
     out.append(fmt_player_header(display_name, rank))
