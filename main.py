@@ -28,6 +28,9 @@ REP_MAX = 100
 PLAYER_DIVIDER_LINE = "════════════════════════════════════"
 SEP_LINE = "────────────────────────"
 
+# Keep under Discord 2000 hard limit with breathing room
+DASHBOARD_PAGE_LIMIT = 1900
+
 
 # -----------------------------
 # LOGGING
@@ -81,7 +84,6 @@ async def defer_ephemeral(interaction: discord.Interaction) -> None:
 
 
 async def log_action(guild: Optional[discord.Guild], text: str) -> None:
-    """Write a line to the command log channel; never crash bot if logging fails."""
     if not guild:
         return
     ch_id = safe_int(os.getenv("COMMAND_LOG_CHANNEL_ID"), DEFAULT_COMMAND_LOG_CHANNEL_ID)
@@ -114,7 +116,6 @@ def render_influence_stars(minus: int, plus: int) -> str:
 
 
 def render_reputation_bar(net: int) -> Tuple[str, str]:
-    """Returns (top_label, bar)"""
     top = "FEARED           <- | ->          LOVED"
     net = clamp(int(net), REP_MIN, REP_MAX)
     pos = int(round((net - REP_MIN) / (REP_MAX - REP_MIN) * 20))
@@ -130,21 +131,59 @@ def render_reputation_bar(net: int) -> Tuple[str, str]:
     return top, f"[{''.join(bar)}]  {net:+d}"
 
 
+def split_pages(text: str, limit: int = DASHBOARD_PAGE_LIMIT) -> List[str]:
+    """
+    Split text into pages <= limit.
+    Prefer splitting on double-newline boundaries, then single newline, then hard split.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+
+    pages: List[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut == -1 or cut < 200:
+            cut = limit  # hard split as last resort
+        page = remaining[:cut].rstrip()
+        pages.append(page)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        pages.append(remaining)
+    return pages
+
+
+def fmt_ids(ids: List[int]) -> str:
+    return ",".join(str(i) for i in ids)
+
+
+def parse_ids(s: Optional[str]) -> List[int]:
+    if not s:
+        return []
+    out: List[int] = []
+    for part in str(s).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except Exception:
+            continue
+    return out
+
+
 # -----------------------------
 # DATABASE
 # -----------------------------
 
 class Database:
-    """
-    Notes on schema compatibility:
-    - Your existing DB may already have an `abilities` table with a different column name
-      (e.g., `ability_name` instead of `ability`).
-    - We detect the real column name at startup and store it in self._abilities_col.
-    """
     def __init__(self, dsn: str):
         self._dsn = dsn
         self._conn: Optional[psycopg.AsyncConnection] = None
-        self._abilities_col: str = "ability"  # will be detected on init_schema
+        self._abilities_col: str = "ability"
 
     async def connect(self) -> None:
         LOG.info("Connecting to PostgreSQL...")
@@ -181,8 +220,6 @@ class Database:
             return row
 
     async def _detect_abilities_column(self) -> str:
-        # Detect which "ability column" exists on the abilities table.
-        # We prefer 'ability' if present; otherwise fall back to known legacy names.
         rows = await self._fetchall(
             """
             SELECT column_name
@@ -194,11 +231,9 @@ class Database:
         for candidate in ("ability", "ability_name", "abilityKey", "ability_key", "skill", "skill_name"):
             if candidate in cols:
                 return candidate
-        # If table doesn't exist yet, our CREATE TABLE will use 'ability'.
         return "ability"
 
     async def init_schema(self) -> None:
-        # Core tables (create if not exist)
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS characters (
@@ -211,8 +246,6 @@ class Database:
             """
         )
 
-        # Abilities table: create canonical version if it doesn't exist.
-        # If it exists with legacy column names, we won't force a rename here.
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS abilities (
@@ -251,17 +284,20 @@ class Database:
             """
         )
 
+        # dashboard_state now supports multiple messages via message_ids (comma-separated)
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS dashboard_state (
                 guild_id      BIGINT PRIMARY KEY,
                 channel_id    BIGINT NOT NULL,
-                message_id    BIGINT
+                message_id    BIGINT,
+                message_ids   TEXT
             );
             """
         )
+        # Add column in case table existed from earlier versions
+        await self._execute("ALTER TABLE dashboard_state ADD COLUMN IF NOT EXISTS message_ids TEXT;")
 
-        # Detect the real abilities column name (supports legacy schemas)
         self._abilities_col = await self._detect_abilities_column()
         LOG.info("Database schema initialized / updated (abilities column=%s)", self._abilities_col)
 
@@ -282,8 +318,7 @@ class Database:
         )
 
     async def remove_character(self, guild_id: int, user_id: int, name: str) -> None:
-        # abilities table primary key differs depending on ability column name; delete with WHERE using detected col
-        await self._execute(f"DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
+        await self._execute("DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
         await self._execute("DELETE FROM influence WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
         await self._execute("DELETE FROM reputation WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
         await self._execute("DELETE FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
@@ -313,9 +348,6 @@ class Database:
         stars = clamp(int(stars), 0, MAX_STARS)
         col = self._abilities_col
 
-        # We must generate SQL that matches the actual column name.
-        # ON CONFLICT target must match an existing unique index/PK. If legacy PK differs,
-        # we fall back to "delete then insert" to be safe.
         try:
             await self._execute(
                 f"""
@@ -326,8 +358,8 @@ class Database:
                 """,
                 (guild_id, user_id, name, ability, stars),
             )
-        except psycopg.errors.UndefinedObject:
-            # Legacy table might not have the matching PK/constraint name; do a safe upsert manually
+        except psycopg.Error:
+            # Fallback for weird legacy constraints
             await self._execute(
                 f"DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND name=%s AND {col}=%s;",
                 (guild_id, user_id, name, ability),
@@ -400,25 +432,27 @@ class Database:
     # -------- dashboard state --------
 
     async def get_dashboard_state(self, guild_id: int) -> Dict[str, Any]:
-        row = await self._fetchone("SELECT guild_id, channel_id, message_id FROM dashboard_state WHERE guild_id=%s;", (guild_id,))
+        row = await self._fetchone("SELECT guild_id, channel_id, message_id, message_ids FROM dashboard_state WHERE guild_id=%s;", (guild_id,))
         if not row:
             ch_id = safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID)
             await self._execute(
-                "INSERT INTO dashboard_state (guild_id, channel_id, message_id) VALUES (%s, %s, NULL) ON CONFLICT DO NOTHING;",
+                "INSERT INTO dashboard_state (guild_id, channel_id, message_id, message_ids) VALUES (%s, %s, NULL, NULL) ON CONFLICT DO NOTHING;",
                 (guild_id, ch_id),
             )
-            return {"guild_id": guild_id, "channel_id": ch_id, "message_id": None}
+            return {"guild_id": guild_id, "channel_id": ch_id, "message_id": None, "message_ids": None}
         return row
 
-    async def set_dashboard_message(self, guild_id: int, channel_id: int, message_id: Optional[int]) -> None:
+    async def set_dashboard_messages(self, guild_id: int, channel_id: int, message_ids: List[int]) -> None:
+        # Keep legacy message_id as first entry for backward compatibility.
+        first = message_ids[0] if message_ids else None
         await self._execute(
             """
-            INSERT INTO dashboard_state (guild_id, channel_id, message_id)
-            VALUES (%s, %s, %s)
+            INSERT INTO dashboard_state (guild_id, channel_id, message_id, message_ids)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (guild_id)
-            DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id;
+            DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id, message_ids=EXCLUDED.message_ids;
             """,
-            (guild_id, channel_id, message_id),
+            (guild_id, channel_id, first, fmt_ids(message_ids) if message_ids else None),
         )
 
 
@@ -438,17 +472,9 @@ class CharacterSnapshot:
 async def build_character_snapshot(db: Database, guild_id: int, user_id: int, name: str) -> CharacterSnapshot:
     abilities_rows = await db.get_abilities(guild_id, user_id, name)
     abilities = [(r["ability"], safe_int(r.get("stars"), 0)) for r in abilities_rows]
-
     inf = await db.get_influence(guild_id, user_id, name)
     rep = await db.get_reputation(guild_id, user_id, name)
-
-    return CharacterSnapshot(
-        name=name,
-        abilities=abilities,
-        minus_stars=inf["minus_stars"],
-        plus_stars=inf["plus_stars"],
-        reputation=rep,
-    )
+    return CharacterSnapshot(name=name, abilities=abilities, minus_stars=inf["minus_stars"], plus_stars=inf["plus_stars"], reputation=rep)
 
 
 async def render_dashboard_post(db: Database, guild: discord.Guild) -> str:
@@ -494,43 +520,97 @@ async def render_dashboard_post(db: Database, guild: discord.Guild) -> str:
     return "\n".join(lines).strip()
 
 
-async def refresh_dashboard_board(client: "VilyraBotClient", guild: discord.Guild) -> None:
+async def refresh_dashboard_board(client: "VilyraBotClient", guild: discord.Guild) -> str:
+    """
+    Updates/creates the dashboard messages. Returns a human-readable status.
+    Does NOT raise for normal failures; it returns the error string.
+    """
     db = client.db
     state = await db.get_dashboard_state(guild.id)
     channel_id = safe_int(state.get("channel_id"), safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID))
-    msg_id = state.get("message_id")
+    stored_ids = parse_ids(state.get("message_ids")) or ([] if not state.get("message_id") else [safe_int(state.get("message_id"))])
+
+    # Fetch channel
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except Exception:
+            channel = None
+
+    if not isinstance(channel, discord.TextChannel):
+        msg = f"Dashboard channel {channel_id} not found or not a text channel."
+        LOG.error(msg)
+        return msg
+
+    # Permission check (common silent failure)
+    me = guild.me or guild.get_member(client.user.id) if client.user else None
+    if me:
+        perms = channel.permissions_for(me)
+        if not (perms.view_channel and perms.send_messages):
+            msg = f"Missing permissions in <#{channel.id}>: need View Channel + Send Messages."
+            LOG.error(msg)
+            return msg
 
     try:
-        channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            raise RuntimeError(f"Dashboard channel {channel_id} not a text channel")
-
         content = await render_dashboard_post(db, guild)
+        pages = split_pages(content, DASHBOARD_PAGE_LIMIT)
+        header = f"**Dashboard Pages:** {len(pages)}"
 
-        msg: Optional[discord.Message] = None
-        if msg_id:
+        # Ensure we have the right number of messages
+        messages: List[discord.Message] = []
+
+        # Try load existing messages
+        for mid in stored_ids:
             try:
-                msg = await channel.fetch_message(int(msg_id))
+                m = await channel.fetch_message(mid)
+                messages.append(m)
             except Exception:
-                msg = None
+                continue
 
-        if msg is None:
-            msg = await channel.send(content)
-            await db.set_dashboard_message(guild.id, channel.id, msg.id)
-            LOG.info("Dashboard message created (guild=%s message=%s)", guild.id, msg.id)
-        else:
-            await msg.edit(content=content)
-            LOG.info("Dashboard message updated (guild=%s message=%s)", guild.id, msg.id)
+        # Create missing messages
+        while len(messages) < len(pages):
+            m = await channel.send("Creating dashboard…")
+            messages.append(m)
 
-    except Exception:
+        # Edit pages into messages (first message includes header)
+        for idx, page in enumerate(pages):
+            body = page
+            if idx == 0:
+                body = f"{header}\n\n{page}"
+            await messages[idx].edit(content=body)
+
+        # Delete extra old messages (if dashboard shrank)
+        for extra in messages[len(pages):]:
+            try:
+                await extra.delete()
+            except Exception:
+                pass
+
+        final_ids = [m.id for m in messages[:len(pages)]]
+        await db.set_dashboard_messages(guild.id, channel.id, final_ids)
+
+        ok = f"Dashboard posted to <#{channel.id}> in {len(pages)} message(s)."
+        LOG.info(ok)
+        return ok
+
+    except discord.HTTPException as e:
+        # Most common: content too long / missing perms / bad request
+        msg = f"Discord HTTP error while posting dashboard: {e}"
+        LOG.exception(msg)
+        return msg
+    except Exception as e:
+        msg = f"Board update failed: {type(e).__name__}: {e}"
         LOG.exception("❌ Board update failed")
+        return msg
 
 
-async def refresh_all_safe(client: "VilyraBotClient", guild: discord.Guild, who: str = "startup") -> None:
+async def refresh_all_safe(client: "VilyraBotClient", guild: discord.Guild, who: str = "startup") -> str:
     try:
-        await refresh_dashboard_board(client, guild)
-    except Exception:
+        return await refresh_dashboard_board(client, guild)
+    except Exception as e:
         LOG.exception("refresh_all_safe failed (who=%s)", who)
+        return f"refresh_all_safe failed: {type(e).__name__}: {e}"
 
 
 # -----------------------------
@@ -541,7 +621,7 @@ class VilyraBotClient(discord.Client):
     def __init__(self, db: Database, **kwargs: Any):
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.members = True  # needed for display names (requires privileged intent in portal if large guild)
+        intents.members = True
         super().__init__(intents=intents, **kwargs)
         self.tree = app_commands.CommandTree(self)
         self.db = db
@@ -556,7 +636,9 @@ class VilyraBotClient(discord.Client):
     async def on_ready(self) -> None:
         LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
         for guild in list(self.guilds):
-            await refresh_all_safe(self, guild, who="on_ready")
+            status = await refresh_all_safe(self, guild, who="on_ready")
+            if "posted to" not in status.lower():
+                LOG.warning("Startup dashboard refresh issue (guild=%s): %s", guild.id, status)
 
 
 # -----------------------------
@@ -592,10 +674,11 @@ async def ensure_character_exists(db: Database, guild_id: int, user_id: int, nam
 async def character_add(interaction: discord.Interaction, name: str):
     await defer_ephemeral(interaction)
     assert interaction.guild is not None
-    await interaction.client.db.add_character(interaction.guild.id, interaction.user.id, name.strip())
-    await log_action(interaction.guild, f"✅ {interaction.user.mention} added character **{name.strip()}**")
-    await refresh_all_safe(interaction.client, interaction.guild, who="character_add")
-    await interaction.followup.send(f"Added character **{name.strip()}**.", ephemeral=True)
+    name = name.strip()
+    await interaction.client.db.add_character(interaction.guild.id, interaction.user.id, name)
+    await log_action(interaction.guild, f"✅ {interaction.user.mention} added character **{name}**")
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="character_add")
+    await interaction.followup.send(f"Added character **{name}**.\n{status}", ephemeral=True)
 
 
 @app_commands.command(name="character_remove", description="Remove one of your characters (deletes associated stats).")
@@ -609,8 +692,8 @@ async def character_remove(interaction: discord.Interaction, name: str):
         return
     await interaction.client.db.remove_character(interaction.guild.id, interaction.user.id, name)
     await log_action(interaction.guild, f"🗑️ {interaction.user.mention} removed character **{name}**")
-    await refresh_all_safe(interaction.client, interaction.guild, who="character_remove")
-    await interaction.followup.send(f"Removed character **{name}**.", ephemeral=True)
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="character_remove")
+    await interaction.followup.send(f"Removed character **{name}**.\n{status}", ephemeral=True)
 
 
 @app_commands.command(name="ability_set", description="Set an ability's star level for one of your characters.")
@@ -620,16 +703,14 @@ async def ability_set(interaction: discord.Interaction, character: str, ability:
     assert interaction.guild is not None
     character = character.strip()
     ability = ability.strip()
-
     if not await ensure_character_exists(interaction.client.db, interaction.guild.id, interaction.user.id, character):
         await interaction.followup.send("That character name wasn't found on your roster.", ephemeral=True)
         return
-
     stars = clamp(int(stars), 0, MAX_STARS)
     await interaction.client.db.set_ability_stars(interaction.guild.id, interaction.user.id, character, ability, stars)
     await log_action(interaction.guild, f"⭐ {interaction.user.mention} set **{character}** ability **{ability}** to {stars} stars")
-    await refresh_all_safe(interaction.client, interaction.guild, who="ability_set")
-    await interaction.followup.send(f"Set **{ability}** for **{character}** to {render_ability_stars(stars)}.", ephemeral=True)
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="ability_set")
+    await interaction.followup.send(f"Set **{ability}** for **{character}** to {render_ability_stars(stars)}.\n{status}", ephemeral=True)
 
 
 @app_commands.command(name="influence_stars_add", description="(Staff) Add influence stars to a character.")
@@ -639,15 +720,16 @@ async def influence_stars_add(interaction: discord.Interaction, user: discord.Me
     await defer_ephemeral(interaction)
     assert interaction.guild is not None
     character = character.strip()
-
     if not await ensure_character_exists(interaction.client.db, interaction.guild.id, user.id, character):
         await interaction.followup.send("That character name wasn't found on that user's roster.", ephemeral=True)
         return
-
     res = await interaction.client.db.add_influence(interaction.guild.id, user.id, character, plus=plus, minus=minus)
     await log_action(interaction.guild, f"➕ {interaction.user.mention} added influence to **{character}** ({user.mention}): {res}")
-    await refresh_all_safe(interaction.client, interaction.guild, who="influence_stars_add")
-    await interaction.followup.send(f"Updated influence for **{character}**: {render_influence_stars(res['minus_stars'], res['plus_stars'])}", ephemeral=True)
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="influence_stars_add")
+    await interaction.followup.send(
+        f"Updated influence for **{character}**: {render_influence_stars(res['minus_stars'], res['plus_stars'])}\n{status}",
+        ephemeral=True,
+    )
 
 
 @app_commands.command(name="influence_stars_remove", description="(Staff) Remove influence stars from a character.")
@@ -657,15 +739,16 @@ async def influence_stars_remove(interaction: discord.Interaction, user: discord
     await defer_ephemeral(interaction)
     assert interaction.guild is not None
     character = character.strip()
-
     if not await ensure_character_exists(interaction.client.db, interaction.guild.id, user.id, character):
         await interaction.followup.send("That character name wasn't found on that user's roster.", ephemeral=True)
         return
-
     res = await interaction.client.db.remove_influence(interaction.guild.id, user.id, character, plus=plus, minus=minus)
     await log_action(interaction.guild, f"➖ {interaction.user.mention} removed influence from **{character}** ({user.mention}): {res}")
-    await refresh_all_safe(interaction.client, interaction.guild, who="influence_stars_remove")
-    await interaction.followup.send(f"Updated influence for **{character}**: {render_influence_stars(res['minus_stars'], res['plus_stars'])}", ephemeral=True)
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="influence_stars_remove")
+    await interaction.followup.send(
+        f"Updated influence for **{character}**: {render_influence_stars(res['minus_stars'], res['plus_stars'])}\n{status}",
+        ephemeral=True,
+    )
 
 
 @app_commands.command(name="reputation_set", description="(Staff) Set reputation net value (-100..+100) for a character.")
@@ -675,16 +758,14 @@ async def reputation_set(interaction: discord.Interaction, user: discord.Member,
     await defer_ephemeral(interaction)
     assert interaction.guild is not None
     character = character.strip()
-
     if not await ensure_character_exists(interaction.client.db, interaction.guild.id, user.id, character):
         await interaction.followup.send("That character name wasn't found on that user's roster.", ephemeral=True)
         return
-
     net = clamp(int(net), REP_MIN, REP_MAX)
     new_net = await interaction.client.db.set_reputation(interaction.guild.id, user.id, character, net)
     await log_action(interaction.guild, f"📈 {interaction.user.mention} set reputation for **{character}** ({user.mention}) to {new_net:+d}")
-    await refresh_all_safe(interaction.client, interaction.guild, who="reputation_set")
-    await interaction.followup.send(f"Reputation for **{character}** set to {new_net:+d}.", ephemeral=True)
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="reputation_set")
+    await interaction.followup.send(f"Reputation for **{character}** set to {new_net:+d}.\n{status}", ephemeral=True)
 
 
 @app_commands.command(name="dashboard_refresh", description="(Staff) Force refresh the dashboard message.")
@@ -693,8 +774,8 @@ async def reputation_set(interaction: discord.Interaction, user: discord.Member,
 async def dashboard_refresh(interaction: discord.Interaction):
     await defer_ephemeral(interaction)
     assert interaction.guild is not None
-    await refresh_all_safe(interaction.client, interaction.guild, who="dashboard_refresh")
-    await interaction.followup.send("Dashboard refreshed.", ephemeral=True)
+    status = await refresh_all_safe(interaction.client, interaction.guild, who="dashboard_refresh")
+    await interaction.followup.send(status, ephemeral=True)
 
 
 # -----------------------------
@@ -711,7 +792,6 @@ async def main_async() -> None:
 
     client = VilyraBotClient(db=db)
 
-    # Register commands
     client.tree.add_command(character_add)
     client.tree.add_command(character_remove)
     client.tree.add_command(ability_set)
