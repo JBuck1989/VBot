@@ -42,7 +42,7 @@ SERVER_RANKS = [
     "Sovereign",
 ]
 
-BORDER_LEN = 60
+BORDER_LEN = 20
 PLAYER_BORDER = "═" * BORDER_LEN
 CHAR_SEPARATOR = "-" * BORDER_LEN
 CHAR_HEADER_LEFT = "꧁•⊹٭ "
@@ -170,12 +170,15 @@ def render_influence_star_bar(neg: int, pos: int) -> str:
 
 
 def render_reputation_block(net_lifetime: int) -> str:
+    # 20/20 line with distinct center marker ┃ and ▲ indicator integrated in-line.
+    # IMPORTANT: The explainer is now end-aligned (no centerline), so it won't "shift" visually between desktop/mobile.
     net = clamp(int(net_lifetime), REP_MIN, REP_MAX)
 
     left_len = 20
     right_len = 20
     total = left_len + right_len
 
+    # Map REP_MIN..REP_MAX onto 0..total (inclusive). net=0 should land exactly at center (left_len).
     pos = int(round((net - REP_MIN) / (REP_MAX - REP_MIN) * total))
     pos = clamp(pos, 0, total)
 
@@ -186,14 +189,16 @@ def render_reputation_block(net_lifetime: int) -> str:
 
     bar_line = "[" + "".join(bar) + "]"
 
-    center_col = 1 + center_idx  # after '['
     left_text = "FEARED ←"
     right_text = "→ LOVED"
-    prefix = left_text + " "
-    pad_left = max(0, center_col - len(prefix))
-    explainer = prefix + (" " * pad_left) + "│" + (" " * pad_left) + " " + right_text
 
-    return explainer + "\n" + bar_line
+    # End-align the explainer to the same visual width as the bar line.
+    spaces = max(1, len(bar_line) - len(left_text) - len(right_text))
+    explainer = left_text + (" " * spaces) + right_text
+
+    return explainer + "
+" + bar_line
+
 
 
 # -----------------------------
@@ -740,7 +745,9 @@ async def build_character_card(db: Database, guild_id: int, user_id: int, name: 
 def render_character_block(card: CharacterCard) -> str:
     net_lifetime = card.lifetime_plus - card.lifetime_minus
     lines: List[str] = []
-    lines.append(CHAR_HEADER_LEFT + card.name + CHAR_HEADER_RIGHT)
+    # Keep the decorative header but bold the name and add spacing so it doesn't wrap awkwardly on mobile
+    lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
+    lines.append("")  # spacer line between header and stats
     lines.append(f"Legacy Points: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
     lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
     lines.append("Influence Stars: " + render_influence_star_bar(card.infl_minus, card.infl_plus))
@@ -750,7 +757,9 @@ def render_character_block(card: CharacterCard) -> str:
         lines.append("Abilities: " + " | ".join(parts))
     else:
         lines.append("Abilities: _none set_")
-    return "\n".join(lines).strip()
+    return "
+".join(lines).strip()
+
 
 
 async def render_player_post(db: Database, guild: discord.Guild, user_id: int) -> str:
