@@ -666,52 +666,94 @@ class Database:
         sql = "INSERT INTO abilities (" + ", ".join(cols) + ") VALUES (" + ", ".join(vals) + ");"
         await self._execute(sql, params)
 
-    async def upgrade_ability(self, guild_id: int, user_id: int, name: str, ability_name: str, pool: str) -> Tuple[int, int]:
-        ability_name = ability_name.strip()
-        pool = pool.strip().lower()
-        if pool not in ("positive", "negative"):
-            raise ValueError("pool must be positive or negative")
 
-        st = await self.get_character_state(guild_id, user_id, name)
-        max_upgrades = 2 + (2 * clamp(st["ability_stars"], 0, MAX_ABILITY_STARS))
+async def upgrade_ability(
+    self,
+    guild_id: int,
+    user_id: int,
+    name: str,
+    ability_name: str,
+    upgrades: int,
+    pay_positive: int,
+    pay_negative: int,
+) -> Tuple[int, int]:
+    """Apply ability upgrades (max 5 per ability). Each upgrade costs 5 legacy points.
+    Points may be paid using any mix of positive/negative AVAILABLE legacy points, but the caller must specify the split.
+    This method NEVER touches lifetime totals.
+    """
+    ability_name = ability_name.strip()
+    upgrades = max(1, int(upgrades))
+    pay_positive = max(0, int(pay_positive))
+    pay_negative = max(0, int(pay_negative))
 
-        char_col = self._ability_where_char()
-        level_col = self.abilities_level_col
+    if upgrades < 1:
+        raise ValueError("upgrades must be >= 1")
 
-        row = await self._fetchone(
-            f"""
-            SELECT COALESCE({level_col}, 0) AS cur_level
-            FROM abilities
-            WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s
-            ORDER BY created_at ASC
-            LIMIT 1;
-            """,
-            (guild_id, user_id, name.strip(), ability_name),
+    total_cost = upgrades * MINOR_UPGRADE_COST
+    if pay_positive + pay_negative != total_cost:
+        raise ValueError(f"Payment must equal {total_cost} points total (5 per upgrade).")
+
+    char_col = self._ability_where_char()
+    level_col = self.abilities_level_col
+
+    row = await self._fetchone(
+        f"""
+        SELECT COALESCE({level_col}, 0) AS cur_level
+        FROM abilities
+        WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s
+        ORDER BY created_at ASC
+        LIMIT 1;
+        """,
+        (guild_id, user_id, name.strip(), ability_name),
+    )
+    if not row:
+        raise ValueError("Ability not found. Add it first with /add_ability.")
+    cur_level = safe_int(row.get("cur_level"), 0)
+
+    max_level = 5
+    if cur_level >= max_level:
+        raise ValueError(f"Upgrade limit reached ({cur_level}/{max_level}).")
+
+    # Clamp requested upgrades to remaining cap
+    remaining = max_level - cur_level
+    if upgrades > remaining:
+        raise ValueError(f"Only {remaining} upgrade(s) remaining for this ability (max {max_level}).")
+
+    # Validate available pools and deduct ONLY from available points
+    st = await self.get_character_state(guild_id, user_id, name)
+    if st["legacy_plus"] < pay_positive:
+        raise ValueError(f"Not enough available positive points (need {pay_positive}, have {st['legacy_plus']}).")
+    if st["legacy_minus"] < pay_negative:
+        raise ValueError(f"Not enough available negative points (need {pay_negative}, have {st['legacy_minus']}).")
+
+    if pay_positive:
+        await self._execute(
+            "UPDATE characters SET legacy_plus=legacy_plus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (pay_positive, guild_id, user_id, name.strip()),
         )
-        if not row:
-            raise ValueError("Ability not found. Add it first with /add_ability.")
-        cur_level = safe_int(row.get("cur_level"), 0)
-        if cur_level >= max_upgrades:
-            raise ValueError(f"Upgrade limit reached ({cur_level}/{max_upgrades}).")
+    if pay_negative:
+        await self._execute(
+            "UPDATE characters SET legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (pay_negative, guild_id, user_id, name.strip()),
+        )
 
-        await self.spend_legacy(guild_id, user_id, name, pool, MINOR_UPGRADE_COST)
-        new_level = cur_level + 1
+    new_level = cur_level + upgrades
 
-        # Update the detected column, and also keep the other column in sync if present
-        sets: List[str] = [f"{level_col}=%s"]
-        params: List[Any] = [new_level]
+    # Update the detected column, and also keep the other column in sync if present
+    sets: List[str] = [f"{level_col}=%s"]
+    params: List[Any] = [new_level]
 
-        if level_col != "upgrade_level" and "upgrade_level" in self.abilities_cols:
-            sets.append("upgrade_level=%s")
-            params.append(new_level)
-        if level_col != "level" and "level" in self.abilities_cols:
-            sets.append("level=%s")
-            params.append(new_level)
+    if level_col != "upgrade_level" and "upgrade_level" in self.abilities_cols:
+        sets.append("upgrade_level=%s")
+        params.append(new_level)
+    if level_col != "level" and "level" in self.abilities_cols:
+        sets.append("level=%s")
+        params.append(new_level)
 
-        params.extend([guild_id, user_id, name.strip(), ability_name])
-        sql = f"UPDATE abilities SET {', '.join(sets)} WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s;"
-        await self._execute(sql, params)
-        return new_level, max_upgrades
+    params.extend([guild_id, user_id, name.strip(), ability_name])
+    sql = f"UPDATE abilities SET {', '.join(sets)} WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s;"
+    await self._execute(sql, params)
+    return new_level, max_level
 
     
     # -------- Dashboard message tracking --------
@@ -1125,24 +1167,55 @@ async def add_ability(interaction: discord.Interaction, user: discord.Member, ch
         await safe_reply(interaction, f"Add ability failed: {e}")
 
 
-@app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points to apply a minor ability upgrade.")
+
+@app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points per upgrade (max 5 upgrades per ability). Requires explicit +/− split.")
 @in_guild_only()
 @staff_only()
-async def upgrade_ability(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_name: str, pool: str):
+async def upgrade_ability(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    ability_name: str,
+    upgrades: int,
+    pay_positive: int,
+    pay_negative: int,
+):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
         character_name = character_name.strip()
         ability_name = ability_name.strip()
-        pool = pool.strip().lower()
+
+        if upgrades < 1:
+            await safe_reply(interaction, "Upgrades must be >= 1.")
+            return
+        if pay_positive < 0 or pay_negative < 0:
+            await safe_reply(interaction, "Payment values must be >= 0.")
+            return
+
         await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        new_level, max_level = await run_db(interaction.client.db.upgrade_ability(interaction.guild.id, user.id, character_name, ability_name, pool), "upgrade_ability")
-        await log_to_channel(interaction.guild, f"🔧 {interaction.user.mention} upgraded **{ability_name}** on **{character_name}** ({user.mention}) -> {new_level}")
+        new_level, max_level = await run_db(
+            interaction.client.db.upgrade_ability(
+                interaction.guild.id,
+                user.id,
+                character_name,
+                ability_name,
+                upgrades,
+                pay_positive,
+                pay_negative,
+            ),
+            "upgrade_ability",
+        )
+        await log_to_channel(
+            interaction.guild,
+            f"🔧 {interaction.user.mention} upgraded **{ability_name}** on **{character_name}** ({user.mention}) -> {new_level}/{max_level} (paid +{pay_positive}/-{pay_negative})",
+        )
         status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
         await safe_reply(interaction, f"Upgraded to level {new_level}/{max_level}. {status}")
     except Exception as e:
         LOG.exception("upgrade_ability failed")
         await safe_reply(interaction, f"Upgrade failed: {e}")
+
 
 
 @app_commands.command(name="refresh_dashboard", description="(Staff) Force refresh the whole dashboard.")
