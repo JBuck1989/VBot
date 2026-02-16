@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import discord
 from discord import app_commands
@@ -323,17 +323,30 @@ class Database:
         )
 
     async def add_legacy(self, guild_id: int, user_id: int, name: str, amount: int) -> None:
-        amt = abs(int(amount))
-        await self._execute(
-            """
-            UPDATE characters
-               SET legacy_plus = legacy_plus + %s,
-                   lifetime_plus = lifetime_plus + %s,
-                   updated_at = now()
-             WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
-            """,
-            (amt, amt, guild_id, user_id, name),
-        )
+        amt = int(amount)
+        if amt >= 0:
+            await self._execute(
+                """
+                UPDATE characters
+                   SET legacy_plus = legacy_plus + %s,
+                       lifetime_plus = lifetime_plus + %s,
+                       updated_at = now()
+                 WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
+                """,
+                (amt, amt, guild_id, user_id, name),
+            )
+        else:
+            n = abs(amt)
+            await self._execute(
+                """
+                UPDATE characters
+                   SET legacy_minus = legacy_minus + %s,
+                       lifetime_minus = lifetime_minus + %s,
+                       updated_at = now()
+                 WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
+                """,
+                (n, n, guild_id, user_id, name),
+            )
 
     async def remove_legacy(self, guild_id: int, user_id: int, name: str, amount: int) -> None:
         amt = abs(int(amount))
@@ -471,6 +484,26 @@ class CharacterSnapshot:
     def net_lifetime(self) -> int:
         return int(self.lifetime_plus - self.lifetime_minus)
 
+
+
+    async def add_influence_stars(self, guild_id: int, user_id: int, name: str, side: str, delta: int) -> None:
+        # side: "plus" or "minus"
+        if delta == 0:
+            return
+        col = "influence_plus" if side == "plus" else "influence_minus"
+        # Clamp 0..5
+        await self._conn.execute(
+            f"UPDATE characters SET {col} = GREATEST(0, LEAST(5, {col} + %s)), updated_at = now() "
+            "WHERE guild_id=%s AND user_id=%s AND name=%s AND archived_at IS NULL",
+            (delta, guild_id, user_id, name),
+        )
+        # Ensure character exists / not archived
+        cur = await self._conn.execute(
+            "SELECT 1 FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s AND archived_at IS NULL",
+            (guild_id, user_id, name),
+        )
+        if await cur.fetchone() is None:
+            raise CharacterNotFoundError()
 
 async def build_character_snapshot(db: Database, guild_id: int, user_id: int, row: Dict[str, Any]) -> CharacterSnapshot:
     name = str(row["name"])
@@ -623,17 +656,51 @@ async def rank_set(interaction: discord.Interaction, user: discord.Member, rank:
     await interaction.followup.send(f"Rank for **{user.display_name}** set to **{rank}**.", ephemeral=True)
 
 
-@app_commands.command(name="legacy_add", description="Add legacy points (+) to a character.")
-@app_commands.describe(user="Owner", character="Character name", amount="Amount to add (positive number)")
-async def legacy_add(interaction: discord.Interaction, user: discord.Member, character: str, amount: int):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+@app_commands.command(name="legacy_add", description="Add legacy points to a character (choose positive or negative).")
+@app_commands.guild_only()
+@app_commands.describe(
+    user="Owner of the character.",
+    character_name="Character name.",
+    direction="Add points as positive or negative.",
+    points="How many points to add (always a positive number here).",
+)
+async def legacy_add(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    direction: Literal["positive", "negative"],
+    points: app_commands.Range[int, 1, 100000],
+):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
 
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.add_legacy(interaction.guild_id, user.id, character, amount)
-    await log_action(interaction.guild, f"➕ {interaction.user} added **{abs(int(amount))}** legacy to **{character}** (owner: {user}).")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"legacy_add by {interaction.user.id}")
-    await interaction.followup.send(f"Added **{abs(int(amount))}** legacy to **{character}**.", ephemeral=True)
+    # Explicit direction prevents Discord UI quirks with negative number fields.
+    amt = points if direction == "positive" else -points
+
+    try:
+        await db.add_legacy(guild.id, user.id, character_name, amt)
+    except CharacterNotFoundError:
+        await interaction.response.send_message("Character not found (or archived).", ephemeral=True)
+        return
+    except Exception:
+        LOG.exception("legacy_add failed")
+        await interaction.response.send_message("Something went wrong while updating legacy points.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ Updated legacy points for **{character_name}** ({direction} {points}).",
+        ephemeral=True,
+    )
+
+    await log_action(
+        guild,
+        f"🧾 **legacy_add** by <@{interaction.user.id}> → {user.mention} / **{character_name}**: {direction} {points}",
+    )
+
+    # Refresh dashboard after changes
+    await refresh_all_safe(guild, who=f"legacy_add by {interaction.user.id}")
 
 
 @app_commands.command(name="legacy_remove", description="Remove legacy points (-) from a character.")
@@ -673,6 +740,53 @@ async def influence_stars_set(interaction: discord.Interaction, user: discord.Me
     await log_action(interaction.guild, f"🌗 {interaction.user} set influence stars for **{character}** (owner: {user}) to **-{clamp(minus,0,5)} / +{clamp(plus,0,5)}**.")
     await refresh_all_safe(interaction.client, interaction.guild, who=f"influence_stars_set by {interaction.user.id}")
     await interaction.followup.send(f"Influence stars for **{character}** set to -{clamp(minus,0,5)} / +{clamp(plus,0,5)}.", ephemeral=True)
+
+
+
+
+@app_commands.command(name="influence_stars_add", description="Add influence stars to a character (choose positive or negative).")
+@app_commands.guild_only()
+@app_commands.describe(
+    user="Owner of the character.",
+    character_name="Character name.",
+    direction="Add stars as positive or negative.",
+    stars="How many stars to add (1-5).",
+)
+async def influence_stars_add(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    direction: Literal["positive", "negative"],
+    stars: app_commands.Range[int, 1, 5],
+):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    side = "plus" if direction == "positive" else "minus"
+
+    try:
+        await db.add_influence_stars(guild.id, user.id, character_name, side=side, delta=stars)
+    except CharacterNotFoundError:
+        await interaction.response.send_message("Character not found (or archived).", ephemeral=True)
+        return
+    except Exception:
+        LOG.exception("influence_stars_add failed")
+        await interaction.response.send_message("Something went wrong while updating influence stars.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"✅ Updated influence stars for **{character_name}** ({direction} +{stars} star(s)).",
+        ephemeral=True,
+    )
+
+    await log_action(
+        guild,
+        f"⭐ **influence_stars_add** by <@{interaction.user.id}> → {user.mention} / **{character_name}**: {direction} +{stars}",
+    )
+
+    await refresh_all_safe(guild, who=f"influence_stars_add by {interaction.user.id}")
 
 
 @app_commands.command(name="ability_custom_add", description="Add a custom ability to a character (starts at 0 upgrades).")
@@ -810,6 +924,7 @@ def main() -> None:
     client.tree.add_command(legacy_remove)
     client.tree.add_command(ability_stars_set)
     client.tree.add_command(influence_stars_set)
+    client.tree.add_command(influence_stars_add)
     client.tree.add_command(ability_custom_add)
     client.tree.add_command(ability_custom_upgrade)
     client.tree.add_command(refresh_dashboard)
