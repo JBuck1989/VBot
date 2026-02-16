@@ -756,8 +756,7 @@ def render_character_block(card: CharacterCard) -> str:
         lines.append("Abilities: " + " | ".join(parts))
     else:
         lines.append("Abilities: _none set_")
-    return "
-".join(lines).strip()
+    return "\n".join(lines).strip()
 
 
 
