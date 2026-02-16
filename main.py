@@ -31,6 +31,7 @@ REP_MAX = 100
 
 # Dashboard formatting
 SEP_LINE = "────────────────────────"
+PLAYER_DIVIDER_LINE = "════════════════════════════════════"
 
 
 # -----------------------------
@@ -513,7 +514,7 @@ class CharacterSnapshot:
 
 async def build_character_snapshot(db: Database, guild_id: int, user_id: int, row: Dict[str, Any]) -> CharacterSnapshot:
     name = str(row["name"])
-    abilities = await db.get_abilities(guild_id, user_id, name)
+    abilities = await interaction.client.db.get_abilities(guild_id, user_id, name)
     return CharacterSnapshot(
         user_id=user_id,
         name=name,
@@ -549,7 +550,7 @@ async def render_dashboard_post(
     user_fallback: str,
 ) -> Optional[str]:
     # Pull active characters for user; if none, no dashboard post
-    chars = await db.get_characters_for_user(guild.id, user_id, include_archived=False)
+    chars = await interaction.client.db.get_characters_for_user(guild.id, user_id, include_archived=False)
     if not chars:
         return None
 
@@ -564,7 +565,7 @@ async def render_dashboard_post(
     except Exception:
         pass
 
-    rank = await db.get_rank(guild.id, user_id)
+    rank = await interaction.client.db.get_rank(guild.id, user_id)
 
     out: List[str] = []
     out.append(fmt_player_header(display_name, rank))
@@ -579,6 +580,7 @@ async def render_dashboard_post(
             out.append(SEP_LINE)
 
     # Protect from accidental pings
+    out.append(PLAYER_DIVIDER_LINE)
     return "\n".join(out)
 
 
@@ -671,15 +673,15 @@ async def legacy_add(interaction: discord.Interaction, user: discord.Member, cha
             await interaction.followup.send("❌ Delta cannot be 0.", ephemeral=True)
             return
 
-        c = await db.get_character(interaction.guild_id, user.id, character_name)
+        c = await interaction.client.db.get_character(interaction.guild_id, user.id, character_name)
         if not c:
             await interaction.followup.send("❌ Character not found (or archived). Use /character_create to create/unarchive.", ephemeral=True)
             return
 
         if delta > 0:
-            await db.add_legacy(interaction.guild_id, user.id, character_name, amount=int(delta))
+            await interaction.client.db.add_legacy(interaction.guild_id, user.id, character_name, amount=int(delta))
         else:
-            await db.remove_legacy(interaction.guild_id, user.id, character_name, amount=abs(int(delta)))
+            await interaction.client.db.remove_legacy(interaction.guild_id, user.id, character_name, amount=abs(int(delta)))
 
         await log_action(interaction.guild, f"legacy_add {delta:+d} → {user} / {character_name}", interaction.user)
         await interaction.followup.send(f"✅ Applied legacy delta **{delta:+d}** to **{character_name}** (owner: {user.mention}).", ephemeral=True)
@@ -694,11 +696,11 @@ async def legacy_remove(interaction: discord.Interaction, user: discord.Member, 
     await defer_ephemeral(interaction)
     try:
         amt = abs(int(amount))
-        c = await db.get_character(interaction.guild_id, user.id, character_name)
+        c = await interaction.client.db.get_character(interaction.guild_id, user.id, character_name)
         if not c:
             await interaction.followup.send("❌ Character not found (or archived).", ephemeral=True)
             return
-        await db.remove_legacy(interaction.guild_id, user.id, character_name, amount=amt)
+        await interaction.client.db.remove_legacy(interaction.guild_id, user.id, character_name, amount=amt)
         await log_action(interaction.guild, f"legacy_remove -{amt} → {user} / {character_name}", interaction.user)
         await interaction.followup.send(f"✅ Subtracted **{amt}** legacy points from **{character_name}**.", ephemeral=True)
         await refresh_all_safe(interaction.guild, who=f"legacy_remove by {interaction.user.id}")
@@ -724,8 +726,6 @@ async def influence_stars_set(interaction: discord.Interaction, user: discord.Me
     await defer_ephemeral(interaction)
     if not is_staff(interaction.user):
         return await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
     await interaction.client.db.set_influence_stars(interaction.guild_id, user.id, character, minus, plus)
     await log_action(interaction.guild, f"🌗 {interaction.user} set influence stars for **{character}** (owner: {user}) to **-{clamp(minus,0,5)} / +{clamp(plus,0,5)}**.")
     await refresh_all_safe(interaction.client, interaction.guild, who=f"influence_stars_set by {interaction.user.id}")
@@ -743,14 +743,14 @@ async def influence_stars_add(interaction: discord.Interaction, user: discord.Me
             await interaction.followup.send("❌ Delta cannot be 0.", ephemeral=True)
             return
 
-        c = await db.get_character(interaction.guild_id, user.id, character_name)
+        c = await interaction.client.db.get_character(interaction.guild_id, user.id, character_name)
         if not c:
             await interaction.followup.send("❌ Character not found (or archived).", ephemeral=True)
             return
 
         side = "plus" if delta > 0 else "minus"
         amt = abs(int(delta))
-        await db.add_influence(interaction.guild_id, user.id, character_name, amount=amt, side=side)
+        await interaction.client.db.add_influence(interaction.guild_id, user.id, character_name, amount=amt, side=side)
 
         await log_action(interaction.guild, f"influence_stars_add {delta:+d} → {user} / {character_name}", interaction.user)
         await interaction.followup.send(f"✅ Applied influence stars delta **{delta:+d}** to **{character_name}**.", ephemeral=True)
@@ -790,8 +790,6 @@ async def refresh_dashboard(interaction: discord.Interaction):
     await defer_ephemeral(interaction)
     if not is_staff(interaction.user):
         return await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
     await refresh_all_safe(interaction.client, interaction.guild, who=f"dashboard_refresh by {interaction.user.id}")
     await log_action(interaction.guild, f"🔄 {interaction.user} refreshed the dashboard.")
     await interaction.followup.send("Dashboard refreshed.", ephemeral=True)
