@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import discord
 from discord import app_commands
@@ -12,40 +12,38 @@ from psycopg.rows import dict_row
 
 
 # -----------------------------
-# CONFIG (edit these)
+# CONFIG
 # -----------------------------
-DASHBOARD_CHANNEL_ID = 1469879866655768738
 
-PLAYER_SEPARATOR_LINE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-PLAYER_BLOCK_DIVIDER = "════════════════════════════════════"  # visual separator between player posts
-COMMAND_LOG_CHANNEL_ID = 1469879960729817098
+DEFAULT_DASHBOARD_CHANNEL_ID = 1469879866655768738
+DEFAULT_COMMAND_LOG_CHANNEL_ID = 1469879960729817098
 
 GUARDIAN_ROLE_NAME = "Guardian"
 WARDEN_ROLE_NAME = "Warden"
 
-# Influence star caps (display only)
 MAX_STARS = 5
-
-# Reputation bar display range; values outside clamp to ends
 REP_MIN = -100
 REP_MAX = 100
 
-# Dashboard formatting
-SEP_LINE = "────────────────────────"
 PLAYER_DIVIDER_LINE = "════════════════════════════════════"
+SEP_LINE = "────────────────────────"
 
 
 # -----------------------------
 # LOGGING
 # -----------------------------
+
 LOG = logging.getLogger("VilyraBot")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] VilyraBot: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] VilyraBot: %(message)s"
+)
 
 
 # -----------------------------
 # UTILS
 # -----------------------------
+
 def env(name: str) -> str:
     v = os.getenv(name)
     if not v:
@@ -62,29 +60,19 @@ def safe_int(v: Any, default: int = 0) -> int:
         return default
 
 
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+
 def is_staff(member: discord.abc.User | discord.Member) -> bool:
-    # Interactions always provide a Member in guild context; but be defensive
-    roles = getattr(member, "roles", []) or []
+    roles = getattr(member, "roles", None) or []
     for r in roles:
         if getattr(r, "name", "") in (GUARDIAN_ROLE_NAME, WARDEN_ROLE_NAME):
             return True
     return False
 
 
-async def log_action(guild: discord.Guild, text: str) -> None:
-    if not COMMAND_LOG_CHANNEL_ID:
-        return
-    try:
-        ch = guild.get_channel(COMMAND_LOG_CHANNEL_ID) or await guild.fetch_channel(COMMAND_LOG_CHANNEL_ID)
-        if isinstance(ch, discord.TextChannel):
-            await ch.send(text, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        # Never crash on logging
-        LOG.exception("Failed to write to command log channel")
-
-
 async def defer_ephemeral(interaction: discord.Interaction) -> None:
-    """Defer quickly to avoid the 3-second interaction timeout."""
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -92,8 +80,17 @@ async def defer_ephemeral(interaction: discord.Interaction) -> None:
         pass
 
 
-def clamp(n: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, n))
+async def log_action(guild: Optional[discord.Guild], text: str) -> None:
+    """Write a line to the command log channel; never crash bot if logging fails."""
+    if not guild:
+        return
+    ch_id = safe_int(os.getenv("COMMAND_LOG_CHANNEL_ID"), DEFAULT_COMMAND_LOG_CHANNEL_ID)
+    try:
+        ch = guild.get_channel(ch_id) or await guild.fetch_channel(ch_id)
+        if isinstance(ch, discord.TextChannel):
+            await ch.send(text, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        LOG.exception("Failed to write to command log channel")
 
 
 def render_ability_stars(n: int) -> str:
@@ -106,12 +103,10 @@ def render_influence_stars(minus: int, plus: int) -> str:
     plus = clamp(int(plus), 0, MAX_STARS)
 
     neg = ["☆"] * MAX_STARS
-    # fill from center outward => right-to-left
     for i in range(minus):
         neg[MAX_STARS - 1 - i] = "★"
 
     pos = ["☆"] * MAX_STARS
-    # fill from center outward => left-to-right
     for i in range(plus):
         pos[i] = "★"
 
@@ -119,788 +114,585 @@ def render_influence_stars(minus: int, plus: int) -> str:
 
 
 def render_reputation_bar(net: int) -> Tuple[str, str]:
-    """
-    Returns 2 lines:
-      FEARED           <- | ->          LOVED
-      --------------------|--------------------
-    With a bold indicator embedded on the dash line.
-    """
+    """Returns (top_label, bar)"""
     top = "FEARED           <- | ->          LOVED"
+    net = clamp(int(net), REP_MIN, REP_MAX)
+    pos = int(round((net - REP_MIN) / (REP_MAX - REP_MIN) * 20))
+    pos = clamp(pos, 0, 20)
 
-    # Build base line
     left = ["-"] * 20
-    right = ["-"] * 20
-    center = "|"
-
-    # Clamp to display range
-    v = clamp(int(net), REP_MIN, REP_MAX)
-
-    # Map [-100..+100] -> 0..40 (41 positions including center)
-    # pos==20 => center
-    pos = int(round(((v - REP_MIN) / (REP_MAX - REP_MIN)) * 40))
-    pos = clamp(pos, 0, 40)
-
-    if pos == 20:
-        center = "●"
-    elif pos < 20:
-        left[pos] = "●"
+    if pos == 0:
+        left[0] = "│"
+    elif pos >= 20:
+        left[-1] = "│"
     else:
-        # pos 21..40 -> right 0..19
-        right[pos - 21] = "●"
-
-    bottom = "".join(left) + center + "".join(right)
-    return top, bottom
-
-
-def fmt_character_header(name: str) -> str:
-    # Bold + italic + underline
-    # Example: __***꧁•⊹٭ Elarion Vaelith ٭⊹•꧂***__
-    return f"__***꧁•⊹٭ {name} ٭⊹•꧂***__"
-
-
-def fmt_player_header(player_name: str, rank: str) -> str:
-    # Underlined + bold per requirement
-    return f"__**Player: {player_name} | Server Rank: {rank}**__"
-
-
-def fmt_abilities(abilities: List[Tuple[str, int]]) -> str:
-    if not abilities:
-        return "—"
-    parts = []
-    for (n, u) in abilities[:7]:
-        parts.append(f"{n} ({safe_int(u, 0)})")
-    return ", ".join(parts)
+        left[pos - 1] = "│"
+    return top, f"[{''.join(left)}]  {net:+d}"
 
 
 # -----------------------------
 # DATABASE
 # -----------------------------
+
 class Database:
     def __init__(self, dsn: str):
-        self.dsn = dsn
+        self._dsn = dsn
         self._conn: Optional[psycopg.AsyncConnection] = None
-        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        if self._conn and not self._conn.closed:
-            return
         LOG.info("Connecting to PostgreSQL...")
-        self._conn = await psycopg.AsyncConnection.connect(self.dsn, row_factory=dict_row)
-        await self._conn.set_autocommit(True)
+        self._conn = await psycopg.AsyncConnection.connect(self._dsn, autocommit=True, row_factory=dict_row)
         LOG.info("PostgreSQL async connection established (autocommit=True)")
 
     async def close(self) -> None:
-        if self._conn and not self._conn.closed:
+        if self._conn:
             await self._conn.close()
+            self._conn = None
 
-    async def _execute(self, sql: str, params: Tuple[Any, ...] = ()) -> None:
-        await self.connect()
-        assert self._conn
-        async with self._lock:
-            async with self._conn.cursor() as cur:
-                await cur.execute(sql, params)
+    def _require_conn(self) -> psycopg.AsyncConnection:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        return self._conn
 
-    async def _fetchall(self, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-        await self.connect()
-        assert self._conn
-        async with self._lock:
-            async with self._conn.cursor() as cur:
-                await cur.execute(sql, params)
-                rows = await cur.fetchall()
-                return list(rows or [])
+    async def _execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        conn = self._require_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
 
-    async def _fetchone(self, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-        rows = await self._fetchall(sql, params)
-        return rows[0] if rows else None
+    async def _fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
+        conn = self._require_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            rows = await cur.fetchall()
+            return list(rows or [])
+
+    async def _fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
+        conn = self._require_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            row = await cur.fetchone()
+            return row
 
     async def init_schema(self) -> None:
+        # Core tables
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS characters (
-              guild_id BIGINT NOT NULL,
-              user_id BIGINT NOT NULL,
-              name TEXT NOT NULL,
-              archived BOOLEAN NOT NULL DEFAULT FALSE,
-              legacy_plus BIGINT NOT NULL DEFAULT 0,
-              legacy_minus BIGINT NOT NULL DEFAULT 0,
-              lifetime_plus BIGINT NOT NULL DEFAULT 0,
-              lifetime_minus BIGINT NOT NULL DEFAULT 0,
-              ability_stars INT NOT NULL DEFAULT 0,
-              influence_minus INT NOT NULL DEFAULT 0,
-              influence_plus INT NOT NULL DEFAULT 0,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              PRIMARY KEY (guild_id, user_id, name)
+                guild_id      BIGINT NOT NULL,
+                user_id       BIGINT NOT NULL,
+                name          TEXT   NOT NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id, name)
             );
             """
         )
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS abilities (
-              guild_id BIGINT NOT NULL,
-              user_id BIGINT NOT NULL,
-              character_name TEXT NOT NULL,
-              ability_name TEXT NOT NULL,
-              upgrades INT NOT NULL DEFAULT 0,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              PRIMARY KEY (guild_id, user_id, character_name, ability_name)
+                guild_id      BIGINT NOT NULL,
+                user_id       BIGINT NOT NULL,
+                name          TEXT   NOT NULL,
+                ability       TEXT   NOT NULL,
+                stars         INT    NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id, name, ability)
             );
             """
         )
         await self._execute(
             """
-            CREATE TABLE IF NOT EXISTS user_ranks (
-              guild_id BIGINT NOT NULL,
-              user_id BIGINT NOT NULL,
-              rank TEXT NOT NULL,
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              PRIMARY KEY (guild_id, user_id)
+            CREATE TABLE IF NOT EXISTS influence (
+                guild_id      BIGINT NOT NULL,
+                user_id       BIGINT NOT NULL,
+                name          TEXT   NOT NULL,
+                minus_stars   INT    NOT NULL DEFAULT 0,
+                plus_stars    INT    NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id, name)
             );
             """
         )
         await self._execute(
             """
-            CREATE TABLE IF NOT EXISTS dashboard_posts (
-              guild_id BIGINT NOT NULL,
-              user_id BIGINT NOT NULL,
-              message_id BIGINT NOT NULL,
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              PRIMARY KEY (guild_id, user_id)
+            CREATE TABLE IF NOT EXISTS reputation (
+                guild_id      BIGINT NOT NULL,
+                user_id       BIGINT NOT NULL,
+                name          TEXT   NOT NULL,
+                net           INT    NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id, name)
+            );
+            """
+        )
+        # Dashboard state (message id per guild)
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_state (
+                guild_id      BIGINT PRIMARY KEY,
+                channel_id    BIGINT NOT NULL,
+                message_id    BIGINT
             );
             """
         )
         LOG.info("Database schema initialized / updated")
 
-    # ---- characters
-    async def upsert_character(self, guild_id: int, user_id: int, name: str) -> None:
+    # -------- characters --------
+
+    async def add_character(self, guild_id: int, user_id: int, name: str) -> None:
         await self._execute(
-            """
-            INSERT INTO characters (guild_id, user_id, name, archived, updated_at)
-            VALUES (%s, %s, %s, FALSE, now())
-            ON CONFLICT (guild_id, user_id, name) DO UPDATE
-              SET archived = FALSE,
-                  updated_at = now();
-            """,
+            "INSERT INTO characters (guild_id, user_id, name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
             (guild_id, user_id, name),
         )
-
-    async def set_archived(self, guild_id: int, user_id: int, name: str, archived: bool) -> None:
+        # Ensure baseline influence/reputation rows exist
         await self._execute(
-            """
-            UPDATE characters
-               SET archived=%s,
-                   updated_at=now()
-             WHERE guild_id=%s AND user_id=%s AND name=%s;
-            """,
-            (archived, guild_id, user_id, name),
-        )
-
-    async def delete_character(self, guild_id: int, user_id: int, name: str) -> None:
-        # delete abilities first
-        await self._execute(
-            "DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND character_name=%s;",
+            "INSERT INTO influence (guild_id, user_id, name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
             (guild_id, user_id, name),
         )
         await self._execute(
-            "DELETE FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            "INSERT INTO reputation (guild_id, user_id, name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
             (guild_id, user_id, name),
         )
 
-    async def get_characters_for_user(self, guild_id: int, user_id: int, include_archived: bool = False) -> List[Dict[str, Any]]:
-        if include_archived:
-            return await self._fetchall(
-                """
-                SELECT * FROM characters
-                 WHERE guild_id=%s AND user_id=%s
-                 ORDER BY lower(name) ASC;
-                """,
-                (guild_id, user_id),
-            )
+    async def remove_character(self, guild_id: int, user_id: int, name: str) -> None:
+        await self._execute("DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
+        await self._execute("DELETE FROM influence WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
+        await self._execute("DELETE FROM reputation WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
+        await self._execute("DELETE FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s;", (guild_id, user_id, name))
+
+    async def get_character(self, guild_id: int, user_id: int, name: str) -> Optional[Dict[str, Any]]:
+        return await self._fetchone(
+            "SELECT guild_id, user_id, name, created_at FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (guild_id, user_id, name),
+        )
+
+    async def list_characters_for_user(self, guild_id: int, user_id: int) -> List[Dict[str, Any]]:
         return await self._fetchall(
-            """
-            SELECT * FROM characters
-             WHERE guild_id=%s AND user_id=%s AND archived=FALSE
-             ORDER BY lower(name) ASC;
-            """,
+            "SELECT name, created_at FROM characters WHERE guild_id=%s AND user_id=%s ORDER BY name ASC;",
             (guild_id, user_id),
         )
 
-    async def get_all_active_characters(self, guild_id: int) -> List[Dict[str, Any]]:
-        return await self._fetchall(
-            """
-            SELECT * FROM characters
-             WHERE guild_id=%s AND archived=FALSE
-             ORDER BY user_id, lower(name);
-            """,
-            (guild_id,),
+    async def list_users_with_characters(self, guild_id: int) -> List[int]:
+        rows = await self._fetchall(
+            "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC;",
+            (guild_id,)
         )
+        return [int(r["user_id"]) for r in rows]
 
-    async def add_legacy(self, guild_id: int, user_id: int, name: str, amount: int) -> None:
-        amt = abs(int(amount))
-        await self._execute(
-            """
-            UPDATE characters
-               SET legacy_plus = legacy_plus + %s,
-                   lifetime_plus = lifetime_plus + %s,
-                   updated_at = now()
-             WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
-            """,
-            (amt, amt, guild_id, user_id, name),
-        )
+    # -------- abilities --------
 
-    async def remove_legacy(self, guild_id: int, user_id: int, name: str, amount: int) -> None:
-        amt = abs(int(amount))
-        await self._execute(
-            """
-            UPDATE characters
-               SET legacy_minus = legacy_minus + %s,
-                   lifetime_minus = lifetime_minus + %s,
-                   updated_at = now()
-             WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
-            """,
-            (amt, amt, guild_id, user_id, name),
-        )
-
-    async def set_ability_stars(self, guild_id: int, user_id: int, name: str, stars: int) -> None:
+    async def set_ability_stars(self, guild_id: int, user_id: int, name: str, ability: str, stars: int) -> None:
         stars = clamp(int(stars), 0, MAX_STARS)
         await self._execute(
             """
-            UPDATE characters
-               SET ability_stars=%s,
-                   updated_at=now()
-             WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
+            INSERT INTO abilities (guild_id, user_id, name, ability, stars)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id, name, ability)
+            DO UPDATE SET stars = EXCLUDED.stars;
             """,
-            (stars, guild_id, user_id, name),
+            (guild_id, user_id, name, ability, stars),
         )
 
-    async def set_influence_stars(self, guild_id: int, user_id: int, name: str, minus: int, plus: int) -> None:
-        minus = clamp(int(minus), 0, MAX_STARS)
-        plus = clamp(int(plus), 0, MAX_STARS)
-        await self._execute(
-            """
-            UPDATE characters
-               SET influence_minus=%s,
-                   influence_plus=%s,
-                   updated_at=now()
-             WHERE guild_id=%s AND user_id=%s AND name=%s AND archived=FALSE;
-            """,
-            (minus, plus, guild_id, user_id, name),
+    async def get_abilities(self, guild_id: int, user_id: int, name: str) -> List[Dict[str, Any]]:
+        return await self._fetchall(
+            "SELECT ability, stars FROM abilities WHERE guild_id=%s AND user_id=%s AND name=%s ORDER BY ability ASC;",
+            (guild_id, user_id, name),
         )
 
-    # ---- abilities
-    async def ability_add(self, guild_id: int, user_id: int, character_name: str, ability_name: str) -> None:
-        await self._execute(
-            """
-            INSERT INTO abilities (guild_id, user_id, character_name, ability_name, upgrades)
-            VALUES (%s, %s, %s, %s, 0)
-            ON CONFLICT (guild_id, user_id, character_name, ability_name) DO NOTHING;
-            """,
-            (guild_id, user_id, character_name, ability_name),
-        )
+    # -------- influence --------
 
-    async def ability_upgrade(self, guild_id: int, user_id: int, character_name: str, ability_name: str, delta: int) -> None:
-        delta = int(delta)
-        await self._execute(
-            """
-            INSERT INTO abilities (guild_id, user_id, character_name, ability_name, upgrades)
-            VALUES (%s, %s, %s, %s, GREATEST(0, %s))
-            ON CONFLICT (guild_id, user_id, character_name, ability_name) DO UPDATE
-              SET upgrades = GREATEST(0, abilities.upgrades + %s),
-                  updated_at = now();
-            """,
-            (guild_id, user_id, character_name, ability_name, delta, delta),
-        )
-
-    async def get_abilities(self, guild_id: int, user_id: int, character_name: str) -> List[Tuple[str, int]]:
-        rows = await self._fetchall(
-            """
-            SELECT ability_name, upgrades
-              FROM abilities
-             WHERE guild_id=%s AND user_id=%s AND character_name=%s
-             ORDER BY lower(ability_name) ASC;
-            """,
-            (guild_id, user_id, character_name),
-        )
-        return [(str(r["ability_name"]), safe_int(r["upgrades"], 0)) for r in rows]
-
-    # ---- ranks
-    async def set_rank(self, guild_id: int, user_id: int, rank: str) -> None:
-        await self._execute(
-            """
-            INSERT INTO user_ranks (guild_id, user_id, rank)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (guild_id, user_id) DO UPDATE
-              SET rank=EXCLUDED.rank, updated_at=now();
-            """,
-            (guild_id, user_id, rank),
-        )
-
-    async def get_rank(self, guild_id: int, user_id: int) -> str:
-        row = await self._fetchone("SELECT rank FROM user_ranks WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
-        if not row:
-            return "—"
-        return str(row.get("rank") or "—")
-
-    # ---- dashboard posts
-    async def get_dashboard_message_id(self, guild_id: int, user_id: int) -> Optional[int]:
+    async def get_influence(self, guild_id: int, user_id: int, name: str) -> Dict[str, int]:
         row = await self._fetchone(
-            "SELECT message_id FROM dashboard_posts WHERE guild_id=%s AND user_id=%s;",
-            (guild_id, user_id),
+            "SELECT minus_stars, plus_stars FROM influence WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (guild_id, user_id, name),
         )
         if not row:
-            return None
-        mid = safe_int(row.get("message_id"), 0)
-        return mid or None
+            return {"minus_stars": 0, "plus_stars": 0}
+        return {"minus_stars": safe_int(row.get("minus_stars"), 0), "plus_stars": safe_int(row.get("plus_stars"), 0)}
 
-    async def set_dashboard_message_id(self, guild_id: int, user_id: int, message_id: int) -> None:
+    async def add_influence(self, guild_id: int, user_id: int, name: str, plus: int = 0, minus: int = 0) -> Dict[str, int]:
+        cur = await self.get_influence(guild_id, user_id, name)
+        new_minus = clamp(cur["minus_stars"] + int(minus), 0, MAX_STARS)
+        new_plus = clamp(cur["plus_stars"] + int(plus), 0, MAX_STARS)
         await self._execute(
             """
-            INSERT INTO dashboard_posts (guild_id, user_id, message_id)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (guild_id, user_id) DO UPDATE
-              SET message_id=EXCLUDED.message_id, updated_at=now();
+            INSERT INTO influence (guild_id, user_id, name, minus_stars, plus_stars)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id, name)
+            DO UPDATE SET minus_stars = EXCLUDED.minus_stars, plus_stars = EXCLUDED.plus_stars;
             """,
-            (guild_id, user_id, message_id),
+            (guild_id, user_id, name, new_minus, new_plus),
+        )
+        return {"minus_stars": new_minus, "plus_stars": new_plus}
+
+    async def remove_influence(self, guild_id: int, user_id: int, name: str, plus: int = 0, minus: int = 0) -> Dict[str, int]:
+        # Removing influence stars is just adding negative deltas
+        return await self.add_influence(guild_id, user_id, name, plus=-int(plus), minus=-int(minus))
+
+    # -------- reputation --------
+
+    async def get_reputation(self, guild_id: int, user_id: int, name: str) -> int:
+        row = await self._fetchone(
+            "SELECT net FROM reputation WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (guild_id, user_id, name),
+        )
+        if not row:
+            return 0
+        return clamp(safe_int(row.get("net"), 0), REP_MIN, REP_MAX)
+
+    async def set_reputation(self, guild_id: int, user_id: int, name: str, net: int) -> int:
+        net = clamp(int(net), REP_MIN, REP_MAX)
+        await self._execute(
+            """
+            INSERT INTO reputation (guild_id, user_id, name, net)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id, name)
+            DO UPDATE SET net = EXCLUDED.net;
+            """,
+            (guild_id, user_id, name, net),
+        )
+        return net
+
+    # -------- dashboard --------
+
+    async def get_dashboard_state(self, guild_id: int) -> Dict[str, Any]:
+        row = await self._fetchone("SELECT guild_id, channel_id, message_id FROM dashboard_state WHERE guild_id=%s;", (guild_id,))
+        if not row:
+            # seed with env/default channel id
+            ch_id = safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID)
+            await self._execute(
+                "INSERT INTO dashboard_state (guild_id, channel_id, message_id) VALUES (%s, %s, NULL) ON CONFLICT DO NOTHING;",
+                (guild_id, ch_id),
+            )
+            return {"guild_id": guild_id, "channel_id": ch_id, "message_id": None}
+        return row
+
+    async def set_dashboard_message(self, guild_id: int, channel_id: int, message_id: Optional[int]) -> None:
+        await self._execute(
+            """
+            INSERT INTO dashboard_state (guild_id, channel_id, message_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id;
+            """,
+            (guild_id, channel_id, message_id),
         )
 
 
-    async def add_influence(self, guild_id: int, user_id: int, name: str, amount: int, side: str = "plus") -> None:
-        amt = max(0, int(amount))
-        if side not in ("plus", "minus"):
-            side = "plus"
-        col = "influence_plus" if side == "plus" else "influence_minus"
-        # clamp 0..5
-        q = f"""
-        UPDATE characters
-        SET {col} = LEAST(5, GREATEST(0, {col} + %s))
-        WHERE guild_id=%s AND user_id=%s AND lower(name)=lower(%s)
-        """
-        async with self.conn.cursor() as cur:
-            await cur.execute(q, (amt, guild_id, user_id, name))
-
-    async def remove_influence(self, guild_id: int, user_id: int, name: str, amount: int, side: str = "plus") -> None:
-        amt = max(0, int(amount))
-        if side not in ("plus", "minus"):
-            side = "plus"
-        col = "influence_plus" if side == "plus" else "influence_minus"
-        q = f"""
-        UPDATE characters
-        SET {col} = LEAST(5, GREATEST(0, {col} - %s))
-        WHERE guild_id=%s AND user_id=%s AND lower(name)=lower(%s)
-        """
-        async with self.conn.cursor() as cur:
-            await cur.execute(q, (amt, guild_id, user_id, name))
-
-
 # -----------------------------
-# SNAPSHOTS + RENDERING
+# DASHBOARD RENDERING
 # -----------------------------
+
 @dataclass
 class CharacterSnapshot:
-    user_id: int
     name: str
-    legacy_plus: int
-    legacy_minus: int
-    lifetime_plus: int
-    lifetime_minus: int
-    ability_stars: int
-    influence_minus: int
-    influence_plus: int
     abilities: List[Tuple[str, int]]
+    minus_stars: int
+    plus_stars: int
+    reputation: int
 
-    @property
-    def net_lifetime(self) -> int:
-        return int(self.lifetime_plus - self.lifetime_minus)
 
+async def build_character_snapshot(db: Database, guild_id: int, user_id: int, name: str) -> CharacterSnapshot:
+    # NOTE: no `interaction` here. This is safe from on_ready/startup paths.
+    abilities_rows = await db.get_abilities(guild_id, user_id, name)
+    abilities = [(r["ability"], safe_int(r["stars"], 0)) for r in abilities_rows]
 
-async def build_character_snapshot(db: Database, guild_id: int, user_id: int, row: Dict[str, Any]) -> CharacterSnapshot:
-    name = str(row["name"])
-    abilities = await interaction.client.db.get_abilities(guild_id, user_id, name)
+    inf = await db.get_influence(guild_id, user_id, name)
+    rep = await db.get_reputation(guild_id, user_id, name)
+
     return CharacterSnapshot(
-        user_id=user_id,
         name=name,
-        legacy_plus=safe_int(row.get("legacy_plus")),
-        legacy_minus=safe_int(row.get("legacy_minus")),
-        lifetime_plus=safe_int(row.get("lifetime_plus")),
-        lifetime_minus=safe_int(row.get("lifetime_minus")),
-        ability_stars=safe_int(row.get("ability_stars")),
-        influence_minus=safe_int(row.get("influence_minus")),
-        influence_plus=safe_int(row.get("influence_plus")),
         abilities=abilities,
+        minus_stars=inf["minus_stars"],
+        plus_stars=inf["plus_stars"],
+        reputation=rep,
     )
 
 
-def render_character_block(c: CharacterSnapshot) -> str:
+async def render_dashboard_post(db: Database, guild: discord.Guild) -> str:
+    """Build the full dashboard text for the whole guild."""
+    user_ids = await db.list_users_with_characters(guild.id)
+    if not user_ids:
+        return "No characters found yet.\n\nUse `/character_add` to get started."
+
     lines: List[str] = []
-    lines.append(fmt_character_header(c.name))
+    lines.append("## Vilyra Legacy Dashboard")
+    lines.append("*(auto-updated; staff can force refresh with `/dashboard_refresh`)*")
     lines.append("")
-    lines.append(f"Legacy Points: +{c.legacy_plus} / -{c.legacy_minus}  ·  Lifetime: +{c.lifetime_plus} / -{c.lifetime_minus}")
-    lines.append(f"Ability Stars: {render_ability_stars(c.ability_stars)}")
-    lines.append(f"Influence Stars: {render_influence_stars(c.influence_minus, c.influence_plus)}")
-    top, bar = render_reputation_bar(c.net_lifetime)
-    lines.append(top)
-    lines.append(bar)
-    lines.append(f"Abilities: {fmt_abilities(c.abilities)}")
-    return "\n".join(lines)
+
+    for uid in user_ids:
+        member = guild.get_member(uid)
+        display = member.display_name if member else f"User {uid}"
+        lines.append(PLAYER_DIVIDER_LINE)
+        lines.append(f"**{display}** (`{uid}`)")
+
+        chars = await db.list_characters_for_user(guild.id, uid)
+        if not chars:
+            lines.append("_No characters._")
+            continue
+
+        for c in chars:
+            name = c["name"]
+            snap = await build_character_snapshot(db, guild.id, uid, name)
+            lines.append(SEP_LINE)
+            lines.append(f"### {snap.name}")
+            lines.append(f"Influence: {render_influence_stars(snap.minus_stars, snap.plus_stars)}")
+            top, bar = render_reputation_bar(snap.reputation)
+            lines.append("Reputation:")
+            lines.append(f"{top}\n{bar}")
+
+            if snap.abilities:
+                lines.append("Abilities:")
+                for ability, stars in snap.abilities:
+                    lines.append(f"- **{ability}**: {render_ability_stars(stars)}")
+            else:
+                lines.append("Abilities: _none set_")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
-async def render_dashboard_post(
-    db: Database,
-    guild: discord.Guild,
-    user_id: int,
-    user_fallback: str,
-) -> Optional[str]:
-    # Pull active characters for user; if none, no dashboard post
-    chars = await db.get_characters_for_user(guild.id, user_id, include_archived=False)
-    if not chars:
-        return None
+async def refresh_dashboard_board(client: "VilyraBotClient", guild: discord.Guild) -> None:
+    """Ensure a single dashboard message exists and is updated. Safe to call from on_ready."""
+    db = client.db
+    state = await db.get_dashboard_state(guild.id)
+    channel_id = safe_int(state.get("channel_id"), safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID))
+    msg_id = state.get("message_id")
 
-    # Resolve display name without pinging; we prefer fetch_member (REST) so it works without privileged intents.
-    display_name = user_fallback
     try:
-        m = guild.get_member(user_id)
-        if m is None:
-            m = await guild.fetch_member(user_id)
-        if m:
-            display_name = m.display_name
+        channel = guild.get_channel(channel_id) or await guild.fetch_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError(f"Dashboard channel {channel_id} not a text channel")
+
+        content = await render_dashboard_post(db, guild)
+
+        msg: Optional[discord.Message] = None
+        if msg_id:
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+            except Exception:
+                msg = None
+
+        if msg is None:
+            msg = await channel.send(content)
+            await db.set_dashboard_message(guild.id, channel.id, msg.id)
+            LOG.info("Dashboard message created (guild=%s message=%s)", guild.id, msg.id)
+        else:
+            await msg.edit(content=content)
+            LOG.info("Dashboard message updated (guild=%s message=%s)", guild.id, msg.id)
+
     except Exception:
-        pass
+        LOG.exception("❌ Board update failed")
+        # Do not raise: never crash bot on dashboard update
 
-    rank = await db.get_rank(guild.id, user_id)
 
-    out: List[str] = []
-    out.append(fmt_player_header(display_name, rank))
-
-    snapshots: List[CharacterSnapshot] = []
-    for r in chars:
-        snapshots.append(await build_character_snapshot(db, guild.id, user_id, r))
-
-    for i, c in enumerate(snapshots):
-        out.append(render_character_block(c))
-        if i != len(snapshots) - 1:
-            out.append(SEP_LINE)
-
-    # Protect from accidental pings
-    out.append(PLAYER_DIVIDER_LINE)
-    return "\n".join(out)
+async def refresh_all_safe(client: "VilyraBotClient", guild: discord.Guild, who: str = "startup") -> None:
+    try:
+        await refresh_dashboard_board(client, guild)
+    except Exception:
+        LOG.exception("refresh_all_safe failed (who=%s)", who)
 
 
 # -----------------------------
-# BOT
+# DISCORD CLIENT
 # -----------------------------
-class VilyraBot(discord.Client):
-    def __init__(self, db: Database):
+
+class VilyraBotClient(discord.Client):
+    def __init__(self, db: Database, **kwargs: Any):
         intents = discord.Intents.default()
         intents.guilds = True
-        super().__init__(intents=intents)
-        self.db = db
+        intents.members = True  # required for display names; safe on most bots with members intent enabled
+        super().__init__(intents=intents, **kwargs)
         self.tree = app_commands.CommandTree(self)
+        self.db = db
 
     async def setup_hook(self) -> None:
-        await self.db.connect()
-        await self.db.init_schema()
-        await self.tree.sync()
-        LOG.info("Guild sync succeeded: %s commands", len(self.tree.get_commands()))
+        # Sync commands to all guilds the bot is in
+        try:
+            await self.tree.sync()
+            LOG.info("Guild sync succeeded: %s commands", len(self.tree.get_commands()))
+        except Exception:
+            LOG.exception("Command sync failed")
 
     async def on_ready(self) -> None:
-        LOG.info("Logged in as %s (ID: %s)", self.user, getattr(self.user, "id", "?"))
-        # Auto-refresh dashboard once on startup
-        guilds = list(self.guilds)
-        if guilds:
-            await refresh_all_safe(self, guilds[0], who="on_ready")
+        LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
+        # Startup refresh for each guild
+        for guild in list(self.guilds):
+            await refresh_all_safe(self, guild, who="on_ready")
 
 
 # -----------------------------
 # COMMANDS
 # -----------------------------
-@app_commands.command(name="character_create", description="Create (or unarchive) a character for a user.")
-@app_commands.describe(user="Owner of the character", name="Character name")
-async def character_create(interaction: discord.Interaction, user: discord.Member, name: str):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
 
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.upsert_character(interaction.guild_id, user.id, name)
-    await log_action(interaction.guild, f"✅ {interaction.user} created/unarchived **{name}** for **{user}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"character_create by {interaction.user.id}")
-    await interaction.followup.send(f"Created/unarchived **{name}** for **{user.display_name}**.", ephemeral=True)
-
-
-@app_commands.command(name="character_archive", description="Archive a character (removes from dashboard; can be restored later).")
-@app_commands.describe(user="Owner of the character", name="Character name")
-async def character_archive(interaction: discord.Interaction, user: discord.Member, name: str):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.set_archived(interaction.guild_id, user.id, name, True)
-    await log_action(interaction.guild, f"📦 {interaction.user} archived **{name}** for **{user}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"character_archive by {interaction.user.id}")
-    await interaction.followup.send(f"Archived **{name}** for **{user.display_name}**.", ephemeral=True)
+def staff_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
+        if isinstance(interaction.user, discord.Member) and is_staff(interaction.user):
+            return True
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
 
 
-@app_commands.command(name="character_delete", description="DELETE a character permanently (cannot be undone).")
-@app_commands.describe(user="Owner of the character", name="Character name")
-async def character_delete(interaction: discord.Interaction, user: discord.Member, name: str):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.delete_character(interaction.guild_id, user.id, name)
-    await log_action(interaction.guild, f"🗑️ {interaction.user} DELETED **{name}** for **{user}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"character_delete by {interaction.user.id}")
-    await interaction.followup.send(f"Deleted **{name}** for **{user.display_name}**.", ephemeral=True)
+def in_guild_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
 
 
-@app_commands.command(name="rank_set", description="Set a player's server rank label (stored; displayed on dashboard).")
-@app_commands.describe(user="Player", rank="Rank label (e.g., Guardian, Warden, etc.)")
-async def rank_set(interaction: discord.Interaction, user: discord.Member, rank: str):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.set_rank(interaction.guild_id, user.id, rank)
-    await log_action(interaction.guild, f"🏷️ {interaction.user} set rank for **{user}** to **{rank}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"rank_set by {interaction.user.id}")
-    await interaction.followup.send(f"Rank for **{user.display_name}** set to **{rank}**.", ephemeral=True)
+async def ensure_character_exists(db: Database, guild_id: int, user_id: int, name: str) -> bool:
+    row = await db.get_character(guild_id, user_id, name)
+    return row is not None
 
 
-@app_commands.command(name="legacy_add", description="Add (+) or subtract (-) legacy points for a character.")
-@app_commands.describe(user="Character owner", character_name="Character name", delta="Positive or negative points (e.g. 5 or -5)")
-async def legacy_add(interaction: discord.Interaction, user: discord.Member, character_name: str, delta: int):
+# ---- character management ----
+
+@app_commands.command(name="character_add", description="Add a character to your roster.")
+@in_guild_only()
+async def character_add(interaction: discord.Interaction, name: str):
     await defer_ephemeral(interaction)
-    try:
-        if delta == 0:
-            await interaction.followup.send("❌ Delta cannot be 0.", ephemeral=True)
-            return
+    assert interaction.guild is not None
+    await interaction.client.db.add_character(interaction.guild.id, interaction.user.id, name.strip())
+    await log_action(interaction.guild, f"✅ {interaction.user.mention} added character **{name.strip()}**")
+    await refresh_all_safe(interaction.client, interaction.guild, who="character_add")
+    await interaction.followup.send(f"Added character **{name.strip()}**.", ephemeral=True)
 
-        c = await interaction.client.db.get_character(interaction.guild_id, user.id, character_name)
-        if not c:
-            await interaction.followup.send("❌ Character not found (or archived). Use /character_create to create/unarchive.", ephemeral=True)
-            return
 
-        if delta > 0:
-            await interaction.client.db.add_legacy(interaction.guild_id, user.id, character_name, amount=int(delta))
-        else:
-            await interaction.client.db.remove_legacy(interaction.guild_id, user.id, character_name, amount=abs(int(delta)))
-
-        await log_action(interaction.guild, f"legacy_add {delta:+d} → {user} / {character_name}", interaction.user)
-        await interaction.followup.send(f"✅ Applied legacy delta **{delta:+d}** to **{character_name}** (owner: {user.mention}).", ephemeral=True)
-
-        await refresh_all_safe(interaction.guild, who=f"legacy_add by {interaction.user.id}")
-    except Exception as e:
-        await interaction.followup.send(f"❌ legacy_add failed: `{type(e).__name__}: {e}`", ephemeral=True)
-
-@app_commands.command(name="legacy_remove", description="Subtract legacy points for a character (adds to negative).")
-@app_commands.describe(user="Character owner", character_name="Character name", amount="Points to subtract (positive number)")
-async def legacy_remove(interaction: discord.Interaction, user: discord.Member, character_name: str, amount: int):
+@app_commands.command(name="character_remove", description="Remove one of your characters (deletes associated stats).")
+@in_guild_only()
+async def character_remove(interaction: discord.Interaction, name: str):
     await defer_ephemeral(interaction)
-    try:
-        amt = abs(int(amount))
-        c = await interaction.client.db.get_character(interaction.guild_id, user.id, character_name)
-        if not c:
-            await interaction.followup.send("❌ Character not found (or archived).", ephemeral=True)
-            return
-        await interaction.client.db.remove_legacy(interaction.guild_id, user.id, character_name, amount=amt)
-        await log_action(interaction.guild, f"legacy_remove -{amt} → {user} / {character_name}", interaction.user)
-        await interaction.followup.send(f"✅ Subtracted **{amt}** legacy points from **{character_name}**.", ephemeral=True)
-        await refresh_all_safe(interaction.guild, who=f"legacy_remove by {interaction.user.id}")
-    except Exception as e:
-        await interaction.followup.send(f"❌ legacy_remove failed: `{type(e).__name__}: {e}`", ephemeral=True)
-
-@app_commands.command(name="ability_stars_set", description="Set a character's ability stars (0–5).")
-@app_commands.describe(user="Owner", character="Character name", stars="0–5")
-async def ability_stars_set(interaction: discord.Interaction, user: discord.Member, character: str, stars: int):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.set_ability_stars(interaction.guild_id, user.id, character, stars)
-    await log_action(interaction.guild, f"⭐ {interaction.user} set ability stars for **{character}** (owner: {user}) to **{clamp(stars,0,5)}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"ability_stars_set by {interaction.user.id}")
-    await interaction.followup.send(f"Ability stars for **{character}** set to **{clamp(stars,0,5)}**.", ephemeral=True)
+    assert interaction.guild is not None
+    exists = await ensure_character_exists(interaction.client.db, interaction.guild.id, interaction.user.id, name.strip())
+    if not exists:
+        await interaction.followup.send("That character name wasn't found on your roster.", ephemeral=True)
+        return
+    await interaction.client.db.remove_character(interaction.guild.id, interaction.user.id, name.strip())
+    await log_action(interaction.guild, f"🗑️ {interaction.user.mention} removed character **{name.strip()}**")
+    await refresh_all_safe(interaction.client, interaction.guild, who="character_remove")
+    await interaction.followup.send(f"Removed character **{name.strip()}**.", ephemeral=True)
 
 
-@app_commands.command(name="influence_stars_set", description="Set a character's influence stars (minus and plus, each 0–5).")
-@app_commands.describe(user="Owner", character="Character name", minus="0–5", plus="0–5")
-async def influence_stars_set(interaction: discord.Interaction, user: discord.Member, character: str, minus: int, plus: int):
+# ---- ability stars ----
+
+@app_commands.command(name="ability_set", description="Set an ability's star level for one of your characters.")
+@in_guild_only()
+async def ability_set(interaction: discord.Interaction, character: str, ability: str, stars: int):
     await defer_ephemeral(interaction)
-    if not is_staff(interaction.user):
-        return await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
-    await interaction.client.db.set_influence_stars(interaction.guild_id, user.id, character, minus, plus)
-    await log_action(interaction.guild, f"🌗 {interaction.user} set influence stars for **{character}** (owner: {user}) to **-{clamp(minus,0,5)} / +{clamp(plus,0,5)}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"influence_stars_set by {interaction.user.id}")
-    await interaction.followup.send(f"Influence stars for **{character}** set to -{clamp(minus,0,5)} / +{clamp(plus,0,5)}.", ephemeral=True)
+    assert interaction.guild is not None
+    character = character.strip()
+    ability = ability.strip()
+    if not await ensure_character_exists(interaction.client.db, interaction.guild.id, interaction.user.id, character):
+        await interaction.followup.send("That character name wasn't found on your roster.", ephemeral=True)
+        return
+    stars = clamp(int(stars), 0, MAX_STARS)
+    await interaction.client.db.set_ability_stars(interaction.guild.id, interaction.user.id, character, ability, stars)
+    await log_action(interaction.guild, f"⭐ {interaction.user.mention} set **{character}** ability **{ability}** to {stars} stars")
+    await refresh_all_safe(interaction.client, interaction.guild, who="ability_set")
+    await interaction.followup.send(f"Set **{ability}** for **{character}** to {render_ability_stars(stars)}.", ephemeral=True)
 
 
+# ---- influence stars (staff) ----
 
-
-@app_commands.command(name="influence_stars_add", description="Add (+) or subtract (-) influence stars for a character.")
-@app_commands.describe(user="Character owner", character_name="Character name", delta="Positive adds Loved stars; negative adds Feared stars (e.g. 1 or -1)")
-async def influence_stars_add(interaction: discord.Interaction, user: discord.Member, character_name: str, delta: int):
+@app_commands.command(name="influence_stars_add", description="(Staff) Add influence stars to a character.")
+@in_guild_only()
+@staff_only()
+async def influence_stars_add(interaction: discord.Interaction, user: discord.Member, character: str, plus: int = 0, minus: int = 0):
     await defer_ephemeral(interaction)
-    try:
-        if delta == 0:
-            await interaction.followup.send("❌ Delta cannot be 0.", ephemeral=True)
-            return
-
-        c = await interaction.client.db.get_character(interaction.guild_id, user.id, character_name)
-        if not c:
-            await interaction.followup.send("❌ Character not found (or archived).", ephemeral=True)
-            return
-
-        side = "plus" if delta > 0 else "minus"
-        amt = abs(int(delta))
-        await interaction.client.db.add_influence(interaction.guild_id, user.id, character_name, amount=amt, side=side)
-
-        await log_action(interaction.guild, f"influence_stars_add {delta:+d} → {user} / {character_name}", interaction.user)
-        await interaction.followup.send(f"✅ Applied influence stars delta **{delta:+d}** to **{character_name}**.", ephemeral=True)
-
-        await refresh_all_safe(interaction.guild, who=f"influence_stars_add by {interaction.user.id}")
-    except Exception as e:
-        await interaction.followup.send(f"❌ influence_stars_add failed: `{type(e).__name__}: {e}`", ephemeral=True)
-
-@app_commands.command(name="ability_custom_add", description="Add a custom ability to a character (starts at 0 upgrades).")
-@app_commands.describe(user="Owner", character="Character name", ability="Ability name")
-async def ability_custom_add(interaction: discord.Interaction, user: discord.Member, character: str, ability: str):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.ability_add(interaction.guild_id, user.id, character, ability)
-    await log_action(interaction.guild, f"🧩 {interaction.user} added ability **{ability}** to **{character}** (owner: {user}).")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"ability_custom_add by {interaction.user.id}")
-    await interaction.followup.send(f"Added ability **{ability}** to **{character}**.", ephemeral=True)
+    assert interaction.guild is not None
+    character = character.strip()
+    if not await ensure_character_exists(interaction.client.db, interaction.guild.id, user.id, character):
+        await interaction.followup.send("That character name wasn't found on that user's roster.", ephemeral=True)
+        return
+    res = await interaction.client.db.add_influence(interaction.guild.id, user.id, character, plus=plus, minus=minus)
+    await log_action(interaction.guild, f"➕ {interaction.user.mention} added influence to **{character}** ({user.mention}): {res}")
+    await refresh_all_safe(interaction.client, interaction.guild, who="influence_stars_add")
+    await interaction.followup.send(f"Updated influence for **{character}**: {render_influence_stars(res['minus_stars'], res['plus_stars'])}", ephemeral=True)
 
 
-@app_commands.command(name="ability_custom_upgrade", description="Adjust upgrade count for a custom ability (can be negative; min 0).")
-@app_commands.describe(user="Owner", character="Character name", ability="Ability name", delta="Change in upgrades (e.g., +1 or -1)")
-async def ability_custom_upgrade(interaction: discord.Interaction, user: discord.Member, character: str, ability: str, delta: int):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.client.db.ability_upgrade(interaction.guild_id, user.id, character, ability, delta)
-    await log_action(interaction.guild, f"🔧 {interaction.user} adjusted upgrades for **{ability}** on **{character}** (owner: {user}) by **{delta:+d}**.")
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"ability_custom_upgrade by {interaction.user.id}")
-    await interaction.followup.send(f"Upgrades for **{ability}** on **{character}** adjusted by **{delta:+d}**.", ephemeral=True)
-
-
-@app_commands.command(name="refresh_dashboard", description="Force-refresh the entire dashboard.")
-async def refresh_dashboard(interaction: discord.Interaction):
+@app_commands.command(name="influence_stars_remove", description="(Staff) Remove influence stars from a character.")
+@in_guild_only()
+@staff_only()
+async def influence_stars_remove(interaction: discord.Interaction, user: discord.Member, character: str, plus: int = 0, minus: int = 0):
     await defer_ephemeral(interaction)
-    if not is_staff(interaction.user):
-        return await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
-    await refresh_all_safe(interaction.client, interaction.guild, who=f"dashboard_refresh by {interaction.user.id}")
-    await log_action(interaction.guild, f"🔄 {interaction.user} refreshed the dashboard.")
+    assert interaction.guild is not None
+    character = character.strip()
+    if not await ensure_character_exists(interaction.client.db, interaction.guild.id, user.id, character):
+        await interaction.followup.send("That character name wasn't found on that user's roster.", ephemeral=True)
+        return
+    res = await interaction.client.db.remove_influence(interaction.guild.id, user.id, character, plus=plus, minus=minus)
+    await log_action(interaction.guild, f"➖ {interaction.user.mention} removed influence from **{character}** ({user.mention}): {res}")
+    await refresh_all_safe(interaction.client, interaction.guild, who="influence_stars_remove")
+    await interaction.followup.send(f"Updated influence for **{character}**: {render_influence_stars(res['minus_stars'], res['plus_stars'])}", ephemeral=True)
+
+
+# ---- reputation (staff) ----
+
+@app_commands.command(name="reputation_set", description="(Staff) Set reputation net value (-100..+100) for a character.")
+@in_guild_only()
+@staff_only()
+async def reputation_set(interaction: discord.Interaction, user: discord.Member, character: str, net: int):
+    await defer_ephemeral(interaction)
+    assert interaction.guild is not None
+    character = character.strip()
+    if not await ensure_character_exists(interaction.client.db, interaction.guild.id, user.id, character):
+        await interaction.followup.send("That character name wasn't found on that user's roster.", ephemeral=True)
+        return
+    net = clamp(int(net), REP_MIN, REP_MAX)
+    new_net = await interaction.client.db.set_reputation(interaction.guild.id, user.id, character, net)
+    await log_action(interaction.guild, f"📈 {interaction.user.mention} set reputation for **{character}** ({user.mention}) to {new_net:+d}")
+    await refresh_all_safe(interaction.client, interaction.guild, who="reputation_set")
+    await interaction.followup.send(f"Reputation for **{character}** set to {new_net:+d}.", ephemeral=True)
+
+
+# ---- dashboard refresh (staff) ----
+
+@app_commands.command(name="dashboard_refresh", description="(Staff) Force refresh the dashboard message.")
+@in_guild_only()
+@staff_only()
+async def dashboard_refresh(interaction: discord.Interaction):
+    await defer_ephemeral(interaction)
+    assert interaction.guild is not None
+    await refresh_all_safe(interaction.client, interaction.guild, who="dashboard_refresh")
     await interaction.followup.send("Dashboard refreshed.", ephemeral=True)
-
-
-@app_commands.command(name="card", description="View one of your character cards (ephemeral).")
-@app_commands.describe(character="Character name")
-async def card(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(ephemeral=True)
-    rows = await interaction.client.db.get_characters_for_user(interaction.guild_id, interaction.user.id, include_archived=False)
-    row = next((r for r in rows if str(r["name"]).lower() == character.lower()), None)
-    if not row:
-        return await interaction.followup.send("Character not found (or archived).", ephemeral=True)
-
-    snap = await build_character_snapshot(interaction.client.db, interaction.guild_id, interaction.user.id, row)
-    await interaction.followup.send(render_character_block(snap), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-
-
-# -----------------------------
-# DASHBOARD REFRESH
-# -----------------------------
-async def refresh_dashboard_board(client: VilyraBot, guild: discord.Guild, who: str) -> None:
-    ch = guild.get_channel(DASHBOARD_CHANNEL_ID) or await guild.fetch_channel(DASHBOARD_CHANNEL_ID)
-    if not isinstance(ch, discord.TextChannel):
-        raise RuntimeError("Dashboard channel ID is not a text channel.")
-
-    # Group active characters by user_id
-    rows = await client.db.get_all_active_characters(guild.id)
-    by_user: Dict[int, List[Dict[str, Any]]] = {}
-    for r in rows:
-        uid = safe_int(r.get("user_id"))
-        by_user.setdefault(uid, []).append(r)
-
-    # We also want dashboard pages for users who have a rank set even if no characters? Spec didn’t require.
-    # So we only render users with active characters.
-
-    for user_id, char_rows in by_user.items():
-        # We want a stable fallback string for display name if fetch fails
-        fallback = f"User {user_id}"
-        try:
-            # Try to pull a safe name (not mention)
-            m = guild.get_member(user_id)
-            if m is None:
-                m = await guild.fetch_member(user_id)
-            if m:
-                fallback = m.display_name
-        except Exception:
-            pass
-
-        content = await render_dashboard_post(client.db, guild, user_id, fallback)
-        if not content:
-            continue
-
-        # Ensure no accidental pings
-        allowed_mentions = discord.AllowedMentions.none()
-
-        existing_id = await client.db.get_dashboard_message_id(guild.id, user_id)
-        if existing_id:
-            try:
-                msg = await ch.fetch_message(existing_id)
-                await msg.edit(content=content, allowed_mentions=allowed_mentions)
-            except discord.NotFound:
-                existing_id = None
-            except Exception:
-                LOG.exception("Failed to edit dashboard post for user %s", user_id)
-
-        if not existing_id:
-            msg = await ch.send(content, allowed_mentions=allowed_mentions)
-            await client.db.set_dashboard_message_id(guild.id, user_id, msg.id)
-
-    await log_action(guild, f"✅ Dashboard updated ({who}).")
-
-
-async def refresh_all_safe(client: VilyraBot, guild: discord.Guild, who: str) -> None:
-    try:
-        await refresh_dashboard_board(client, guild, who=who)
-    except Exception as e:
-        LOG.exception("refresh_all_safe failed")
-        try:
-            await log_action(guild, f"❌ Board update failed ({who}): {type(e).__name__}: {e}")
-        except Exception:
-            pass
 
 
 # -----------------------------
 # MAIN
 # -----------------------------
-def main() -> None:
+
+async def main_async() -> None:
     token = env("DISCORD_TOKEN")
     dsn = env("DATABASE_URL")
 
     db = Database(dsn)
-    client = VilyraBot(db)
+    await db.connect()
+    await db.init_schema()
 
-    # Register commands on the instance tree (not on the class)
-    client.tree.add_command(character_create)
-    client.tree.add_command(character_archive)
-    client.tree.add_command(character_delete)
-    client.tree.add_command(rank_set)
-    client.tree.add_command(legacy_add)
-    client.tree.add_command(legacy_remove)
-    client.tree.add_command(ability_stars_set)
-    client.tree.add_command(influence_stars_set)
-    client.tree.add_command(ability_custom_add)
-    client.tree.add_command(ability_custom_upgrade)
-    client.tree.add_command(refresh_dashboard)
-    client.tree.add_command(card)
+    client = VilyraBotClient(db=db)
 
-    client.run(token)
+    # Register commands on the tree
+    client.tree.add_command(character_add)
+    client.tree.add_command(character_remove)
+    client.tree.add_command(ability_set)
+    client.tree.add_command(influence_stars_add)
+    client.tree.add_command(influence_stars_remove)
+    client.tree.add_command(reputation_set)
+    client.tree.add_command(dashboard_refresh)
+
+    try:
+        await client.start(token)
+    finally:
+        await db.close()
+
+
+def main() -> None:
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
