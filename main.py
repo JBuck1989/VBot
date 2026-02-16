@@ -1019,14 +1019,19 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
     chars = await db.list_characters(guild.id, user_id)
     stored_ids, stored_hash, dash_ts = await db.get_dashboard_entry(guild.id, user_id)
 
-# Skip startup refresh for this player if nothing changed since last dashboard update.
-try:
-    latest_ts = await db.get_latest_player_data_updated_at(guild.id, user_id)
-    if dash_ts and latest_ts and latest_ts <= dash_ts:
-        LOG.info("Dashboard up-to-date for user_id=%s (latest_ts=%s <= dash_ts=%s); skipping.", user_id, latest_ts, dash_ts)
-        return "skipped"
-except Exception as ex:
-    LOG.warning("Could not compute latest player data timestamp for user_id=%s: %s", user_id, ex)
+    # Skip startup refresh for this player if nothing changed since last dashboard update.
+    try:
+        latest_ts = await db.get_latest_player_data_updated_at(guild.id, user_id)
+        if dash_ts and latest_ts and latest_ts <= dash_ts:
+            LOG.info(
+                "Dashboard up-to-date for user_id=%s (latest_ts=%s <= dash_ts=%s); skipping.",
+                user_id,
+                latest_ts,
+                dash_ts,
+            )
+            return "skipped"
+    except Exception as ex:
+        LOG.warning("Could not compute latest player data timestamp for user_id=%s: %s", user_id, ex)
 
     if not chars:
         for mid in stored_ids:
@@ -1389,6 +1394,13 @@ class VilyraBotClient(discord.Client):
                     try:
                         synced2 = await self.tree.sync()
                         LOG.info("Global sync fallback succeeded: %s commands", len(synced2))
+                        try:
+                            # As a last resort, clear guild commands and re-sync to resolve "outdated" command schemas.
+                            self.tree.clear_commands(guild=discord.Object(id=gid))
+                            synced3 = await self.tree.sync(guild=discord.Object(id=gid))
+                            LOG.info("Guild re-sync after clear succeeded: %s commands", len(synced3))
+                        except Exception as ex3:
+                            LOG.warning("Guild re-sync after clear failed: %s", ex3)
                     except Exception as ex2:
                         LOG.exception("Global sync fallback failed: %s", ex2)
                 if len(synced)==0:
