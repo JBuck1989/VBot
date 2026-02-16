@@ -9,7 +9,6 @@ from discord import app_commands
 
 import psycopg
 from psycopg.rows import dict_row
-from psycopg import errors as pg_errors
 
 
 # -----------------------------
@@ -171,7 +170,6 @@ def render_influence_star_bar(neg: int, pos: int) -> str:
 
 
 def render_reputation_block(net_lifetime: int) -> str:
-    # 20/20 line with distinct center marker ┃ and ▲ indicator integrated in-line
     net = clamp(int(net_lifetime), REP_MIN, REP_MAX)
 
     left_len = 20
@@ -199,14 +197,22 @@ def render_reputation_block(net_lifetime: int) -> str:
 
 
 # -----------------------------
-# Database Layer (matches your schema)
+# Database Layer (schema autodetect)
 # -----------------------------
 
 class Database:
     def __init__(self, dsn: str):
         self._dsn = dsn
         self._conn: Optional[psycopg.AsyncConnection] = None
+
+        # Detected columns
         self.characters_cols: set[str] = set()
+        self.abilities_cols: set[str] = set()
+
+        # Detected "level" column in abilities (upgrade_level vs level)
+        self.abilities_level_col: str = "upgrade_level"
+        # Detected "character name" column in abilities (character_name vs name)
+        self.abilities_char_col: str = "character_name"
 
     async def connect(self) -> None:
         LOG.info("Connecting to PostgreSQL...")
@@ -241,39 +247,66 @@ class Database:
             rows = await cur.fetchall()
             return list(rows or [])
 
-    async def _load_characters_columns(self) -> None:
+    async def _load_table_columns(self, table: str) -> set[str]:
         rows = await self._fetchall(
             """
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema='public' AND table_name='characters';
-            """
+            WHERE table_schema='public' AND table_name=%s;
+            """,
+            (table,),
         )
-        self.characters_cols = {str(r["column_name"]) for r in rows if r and r.get("column_name")}
-        LOG.info("Detected characters columns: %s", ", ".join(sorted(self.characters_cols)))
+        return {str(r["column_name"]) for r in rows if r and r.get("column_name")}
+
+    async def detect_schema(self) -> None:
+        self.characters_cols = await self._load_table_columns("characters")
+        self.abilities_cols = await self._load_table_columns("abilities")
+
+        LOG.info("Detected characters columns: %s", ", ".join(sorted(self.characters_cols)) if self.characters_cols else "(none)")
+        LOG.info("Detected abilities columns: %s", ", ".join(sorted(self.abilities_cols)) if self.abilities_cols else "(none)")
+
+        # Abilities: level column
+        if "upgrade_level" in self.abilities_cols:
+            self.abilities_level_col = "upgrade_level"
+        elif "level" in self.abilities_cols:
+            self.abilities_level_col = "level"
+        else:
+            self.abilities_level_col = "upgrade_level"  # will be added
+
+        # Abilities: character column
+        if "character_name" in self.abilities_cols:
+            self.abilities_char_col = "character_name"
+        elif "name" in self.abilities_cols:
+            self.abilities_char_col = "name"
+        else:
+            self.abilities_char_col = "character_name"  # will be added
+
+        LOG.info("Schema choices: abilities.%s as level, abilities.%s as character key",
+                 self.abilities_level_col, self.abilities_char_col)
 
     async def init_schema(self) -> None:
-        # Your `characters` table already exists. We do NOT drop anything.
-        # We only add missing columns needed for our features.
+        # Characters table exists already in your DB. We never drop it.
+        # Add the columns our bot needs, in case they were missing.
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS ability_stars INT NOT NULL DEFAULT 0;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_minus INT NOT NULL DEFAULT 0;")
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_plus INT NOT NULL DEFAULT 0;")  # in case
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_plus INT NOT NULL DEFAULT 0;")      # in case
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_minus INT NOT NULL DEFAULT 0;")     # in case
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS lifetime_plus INT NOT NULL DEFAULT 0;")    # in case
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS lifetime_minus INT NOT NULL DEFAULT 0;")   # in case
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;") # in case
+
+        # Ensure these exist too (your DB already has most of them, but safe):
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_plus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_minus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS lifetime_plus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS lifetime_minus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_plus INT NOT NULL DEFAULT 0;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
-        # Unique index so we can safely upsert by (guild_id, user_id, name)
+        # Unique index (needed for ON CONFLICT)
         try:
             await self._execute("CREATE UNIQUE INDEX IF NOT EXISTS characters_unique ON characters (guild_id, user_id, name);")
         except Exception:
-            # If table is huge or permissions weird, don't brick startup.
             LOG.exception("Could not create unique index on characters; continuing")
 
-        # Players table for server rank (separate; safe)
+        # Players table (server rank)
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS players (
@@ -286,7 +319,7 @@ class Database:
             """
         )
 
-        # Abilities table (separate; safe)
+        # Abilities table — create if missing
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS abilities (
@@ -295,13 +328,28 @@ class Database:
                 character_name TEXT NOT NULL,
                 ability_name   TEXT NOT NULL,
                 upgrade_level  INT  NOT NULL DEFAULT 0,
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, user_id, character_name, ability_name)
+                level          INT  NULL,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
+        # Add missing columns to existing abilities table
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS character_name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS ability_name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS upgrade_level INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS level INT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
-        # Dashboard message tracking (safe)
+        # If we have an older table that used (guild_id,user_id,name,ability_name) as keys,
+        # we can't safely add a PRIMARY KEY without knowing duplicates; so we do not force it.
+        # We *do* add an index that helps our lookups:
+        try:
+            await self._execute("CREATE INDEX IF NOT EXISTS abilities_lookup ON abilities (guild_id, user_id, character_name, ability_name);")
+        except Exception:
+            LOG.exception("Could not create abilities index; continuing")
+
+        # Dashboard tracking
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS dashboard_messages (
@@ -315,7 +363,7 @@ class Database:
             """
         )
 
-        await self._load_characters_columns()
+        await self.detect_schema()
         LOG.info("Database schema initialized / updated")
 
     # -------- Players --------
@@ -344,8 +392,6 @@ class Database:
         if not name:
             raise ValueError("Character name cannot be empty.")
 
-        # We upsert into your existing table. Uses only columns that exist.
-        # Your table *does* have "name", so we always target that.
         await self._execute(
             """
             INSERT INTO characters (guild_id, user_id, name, archived, legacy_plus, legacy_minus, lifetime_plus, lifetime_minus, influence_plus, influence_minus, ability_stars, updated_at)
@@ -356,7 +402,6 @@ class Database:
             (guild_id, user_id, name),
         )
 
-        # Ensure player exists
         await self._execute(
             "INSERT INTO players (guild_id, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
             (guild_id, user_id),
@@ -458,7 +503,6 @@ class Database:
         pool = pool.strip().lower() if pool else None
         st = await self.get_character_state(guild_id, user_id, name)
 
-        # NOTE: influence_plus/minus are STAR COUNTS here (0-5 total), not points.
         infl_total = st["influence_plus"] + st["influence_minus"]
 
         if star_type == "influence_positive":
@@ -524,18 +568,42 @@ class Database:
             (a, ip, im, guild_id, user_id, name.strip()),
         )
 
-    # -------- Abilities --------
+    # -------- Abilities (schema-flex) --------
+
+    def _ability_level_expr(self) -> str:
+        # We always SELECT as "upgrade_level" to keep renderer stable
+        if self.abilities_level_col == "upgrade_level":
+            return "COALESCE(upgrade_level, 0) AS upgrade_level"
+        return "COALESCE(level, 0) AS upgrade_level"
+
+    def _ability_where_char(self) -> str:
+        return self.abilities_char_col
 
     async def list_abilities(self, guild_id: int, user_id: int, name: str) -> List[Tuple[str, int]]:
-        rows = await self._fetchall(
-            """
-            SELECT ability_name, upgrade_level
-            FROM abilities
-            WHERE guild_id=%s AND user_id=%s AND character_name=%s
-            ORDER BY created_at ASC, ability_name ASC;
-            """,
-            (guild_id, user_id, name.strip()),
-        )
+        # If schema changed since startup, re-detect once
+        try:
+            rows = await self._fetchall(
+                f"""
+                SELECT ability_name, {self._ability_level_expr()}
+                FROM abilities
+                WHERE guild_id=%s AND user_id=%s AND {self._ability_where_char()}=%s
+                ORDER BY created_at ASC, ability_name ASC;
+                """,
+                (guild_id, user_id, name.strip()),
+            )
+        except Exception:
+            # Last-resort: refresh detection and retry once
+            await self.detect_schema()
+            rows = await self._fetchall(
+                f"""
+                SELECT ability_name, {self._ability_level_expr()}
+                FROM abilities
+                WHERE guild_id=%s AND user_id=%s AND {self._ability_where_char()}=%s
+                ORDER BY created_at ASC, ability_name ASC;
+                """,
+                (guild_id, user_id, name.strip()),
+            )
+
         out: List[Tuple[str, int]] = []
         for r in rows:
             if r and r.get("ability_name"):
@@ -551,48 +619,68 @@ class Database:
         cap = 2 + clamp(st["ability_stars"], 0, MAX_ABILITY_STARS)
         if len(current) >= cap:
             raise ValueError(f"Ability capacity reached ({len(current)}/{cap}). Earn more Ability Stars to add abilities.")
-        await self._execute(
-            """
-            INSERT INTO abilities (guild_id, user_id, character_name, ability_name, upgrade_level)
-            VALUES (%s, %s, %s, %s, 0)
-            ON CONFLICT (guild_id, user_id, character_name, ability_name) DO NOTHING;
-            """,
-            (guild_id, user_id, name.strip(), ability_name),
-        )
+
+        # Insert using whatever character column exists; also initialize both level columns if present.
+        char_col = self._ability_where_char()
+        cols = ["guild_id", "user_id", char_col, "ability_name", "created_at"]
+        vals = ["%s", "%s", "%s", "%s", "NOW()"]
+        params: List[Any] = [guild_id, user_id, name.strip(), ability_name]
+
+        if "upgrade_level" in self.abilities_cols:
+            cols.append("upgrade_level")
+            vals.append("0")
+        if "level" in self.abilities_cols:
+            cols.append("level")
+            vals.append("0")
+
+        sql = "INSERT INTO abilities (" + ", ".join(cols) + ") VALUES (" + ", ".join(vals) + ");"
+        await self._execute(sql, params)
 
     async def upgrade_ability(self, guild_id: int, user_id: int, name: str, ability_name: str, pool: str) -> Tuple[int, int]:
         ability_name = ability_name.strip()
         pool = pool.strip().lower()
         if pool not in ("positive", "negative"):
             raise ValueError("pool must be positive or negative")
+
         st = await self.get_character_state(guild_id, user_id, name)
         max_upgrades = 2 + (2 * clamp(st["ability_stars"], 0, MAX_ABILITY_STARS))
 
+        char_col = self._ability_where_char()
+        level_col = self.abilities_level_col
+
         row = await self._fetchone(
-            """
-            SELECT upgrade_level
+            f"""
+            SELECT COALESCE({level_col}, 0) AS cur_level
             FROM abilities
-            WHERE guild_id=%s AND user_id=%s AND character_name=%s AND ability_name=%s
+            WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s
+            ORDER BY created_at ASC
             LIMIT 1;
             """,
             (guild_id, user_id, name.strip(), ability_name),
         )
         if not row:
             raise ValueError("Ability not found. Add it first with /add_ability.")
-        cur_level = safe_int(row.get("upgrade_level"), 0)
+        cur_level = safe_int(row.get("cur_level"), 0)
         if cur_level >= max_upgrades:
             raise ValueError(f"Upgrade limit reached ({cur_level}/{max_upgrades}).")
 
         await self.spend_legacy(guild_id, user_id, name, pool, MINOR_UPGRADE_COST)
         new_level = cur_level + 1
-        await self._execute(
-            """
-            UPDATE abilities
-            SET upgrade_level=%s
-            WHERE guild_id=%s AND user_id=%s AND character_name=%s AND ability_name=%s;
-            """,
-            (new_level, guild_id, user_id, name.strip(), ability_name),
-        )
+
+        # Update the detected column, and also keep the other column in sync if present
+        sets: List[str] = [f"{level_col}=%s"]
+        params: List[Any] = [new_level]
+
+        if level_col != "upgrade_level" and "upgrade_level" in self.abilities_cols:
+            sets.append("upgrade_level=%s")
+            params.append(new_level)
+        if level_col != "level" and "level" in self.abilities_cols:
+            sets.append("level=%s")
+            params.append(new_level)
+
+        params.extend([guild_id, user_id, name.strip(), ability_name])
+        sql = f"UPDATE abilities SET {', '.join(sets)} WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s;"
+        await self._execute(sql, params)
         return new_level, max_upgrades
 
     # -------- Dashboard message tracking --------
@@ -1016,7 +1104,7 @@ class VilyraBotClient(discord.Client):
     def __init__(self, db: Database):
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.members = True  # needed for nicknames in dashboard
+        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.db = db
@@ -1039,11 +1127,11 @@ class VilyraBotClient(discord.Client):
         try:
             gid = safe_int(os.getenv("GUILD_ID"), 0)
             if gid:
-                await self.tree.sync(guild=discord.Object(id=gid))
-                LOG.info("Guild sync succeeded: %s commands", len(self.tree.get_commands(guild=discord.Object(id=gid))))
+                synced = await self.tree.sync(guild=discord.Object(id=gid))
+                LOG.info("Guild sync succeeded: %s commands", len(synced))
             else:
-                await self.tree.sync()
-                LOG.info("Global sync succeeded: %s commands", len(self.tree.get_commands()))
+                synced = await self.tree.sync()
+                LOG.info("Global sync succeeded: %s commands", len(synced))
         except Exception:
             LOG.exception("Command sync failed")
 
