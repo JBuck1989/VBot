@@ -391,7 +391,7 @@ class Database:
             );
             """
         )
-
+        await self._execute("ALTER TABLE dashboard_messages ADD COLUMN IF NOT EXISTS content_hash TEXT;")
         await self.detect_schema()
         LOG.info("Database schema initialized / updated")
 
@@ -714,17 +714,31 @@ class Database:
 
     # -------- Dashboard message tracking --------
 
-    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str]]:
-        row = await self._fetchone("SELECT message_ids, content_hash FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
+async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str]]:
+    try:
+        row = await self._fetchone(
+            "SELECT message_ids, content_hash FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+            (guild_id, user_id),
+        )
         ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
         h = str(row["content_hash"]) if row and row.get("content_hash") else None
         return ids, h
+    except psycopg.errors.UndefinedColumn:
+        # Older schema: dashboard_messages has no content_hash yet.
+        row = await self._fetchone(
+            "SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+            (guild_id, user_id),
+        )
+        ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+        return ids, None
 
-    async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-        row = await self._fetchone("SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
-        return parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
+    ids, _ = await self.get_dashboard_entry(guild_id, user_id)
+    return ids
 
-    async def set_dashboard_message_ids(self, guild_id: int, user_id: int, channel_id: int, ids: List[int], h: Optional[str] = None) -> None:
+
+async def set_dashboard_message_ids(self, guild_id: int, user_id: int, channel_id: int, ids: List[int], h: Optional[str] = None) -> None:
+    try:
         await self._execute(
             """
             INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
@@ -734,8 +748,20 @@ class Database:
             """,
             (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
         )
+    except psycopg.errors.UndefinedColumn:
+        # Older schema: no content_hash column.
+        await self._execute(
+            """
+            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET channel_id=EXCLUDED.channel_id, message_ids=EXCLUDED.message_ids, updated_at=NOW();
+            """,
+            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
+        )
 
-    async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
+async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
+
         await self._execute("DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
 
 
