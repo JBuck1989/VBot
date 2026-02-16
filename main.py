@@ -765,6 +765,13 @@ async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None
         await self._execute("DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
 
 
+# Bind module-level dashboard helpers onto Database for backward compatibility (fixes accidental dedent)
+Database.get_dashboard_entry = get_dashboard_entry
+Database.get_dashboard_message_ids = get_dashboard_message_ids
+Database.set_dashboard_message_ids = set_dashboard_message_ids
+Database.clear_dashboard_message_ids = clear_dashboard_message_ids
+
+
 # -----------------------------
 # Domain model + rendering
 # -----------------------------
