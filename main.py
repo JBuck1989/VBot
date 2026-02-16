@@ -9,11 +9,8 @@ from discord import app_commands
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg import errors as pg_errors
 
-
-# -----------------------------
-# CONFIG
-# -----------------------------
 
 DEFAULT_DASHBOARD_CHANNEL_ID = 1469879866655768738
 DEFAULT_COMMAND_LOG_CHANNEL_ID = 1469879960729817098
@@ -30,7 +27,6 @@ MINOR_UPGRADE_COST = 5
 REP_MIN = -100
 REP_MAX = 100
 
-# Discord hard limit is 2000; we leave headroom for safety.
 PLAYER_POST_SOFT_LIMIT = 1900
 
 SERVER_RANKS = [
@@ -43,7 +39,6 @@ SERVER_RANKS = [
     "Sovereign",
 ]
 
-# Dashboard styling
 BORDER_LEN = 60
 PLAYER_BORDER = "═" * BORDER_LEN
 CHAR_SEPARATOR = "-" * BORDER_LEN
@@ -51,20 +46,9 @@ CHAR_HEADER_LEFT = "꧁•⊹٭ "
 CHAR_HEADER_RIGHT = " ٭⊹•꧂"
 
 
-# -----------------------------
-# LOGGING
-# -----------------------------
-
 LOG = logging.getLogger("VilyraBot")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] VilyraBot: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] VilyraBot: %(message)s")
 
-
-# -----------------------------
-# UTILS
-# -----------------------------
 
 def env(name: str) -> str:
     v = os.getenv(name)
@@ -107,7 +91,6 @@ async def defer_ephemeral(interaction: discord.Interaction) -> None:
 
 
 async def safe_followup(interaction: discord.Interaction, content: str) -> None:
-    """Always tries to complete the interaction with an ephemeral message."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(content, ephemeral=True)
@@ -118,7 +101,6 @@ async def safe_followup(interaction: discord.Interaction, content: str) -> None:
 
 
 async def run_db(coro, label: str):
-    """Run DB coroutine with timeout so interactions can't hang forever."""
     try:
         return await asyncio.wait_for(coro, timeout=db_timeout())
     except asyncio.TimeoutError as e:
@@ -156,20 +138,12 @@ def parse_ids(s: Optional[str]) -> List[int]:
     return out
 
 
-# -----------------------------
-# RENDER HELPERS
-# -----------------------------
-
 def render_ability_star_bar(n: int) -> str:
     n = clamp(int(n), 0, MAX_ABILITY_STARS)
     return "★" * n + "☆" * (MAX_ABILITY_STARS - n)
 
 
 def render_influence_star_bar(neg: int, pos: int) -> str:
-    """
-    User-approved fill behavior (keep as previously working).
-    Negative fills from the RIGHT of the left segment; positive fills from the LEFT of right segment.
-    """
     neg = clamp(int(neg), 0, MAX_INFL_STARS_TOTAL)
     pos = clamp(int(pos), 0, MAX_INFL_STARS_TOTAL)
 
@@ -185,32 +159,22 @@ def render_influence_star_bar(neg: int, pos: int) -> str:
 
 
 def render_reputation_block(net_lifetime: int) -> str:
-    """
-    Two-line mobile-safe reputation block:
-      FEARED ←      │      → LOVED
-      [--------------------┃----▲---------------]
-    - 20/20 bar => 40 steps across -100..+100 (~5 points/step)
-    - Center marker on bar is ┃
-    - Indicator embedded is ▲
-    - Explainer uses │ centered above bar
-    """
     net = clamp(int(net_lifetime), REP_MIN, REP_MAX)
 
     left_len = 20
     right_len = 20
-    total = left_len + right_len  # 40 steps
-    # Map -100..+100 -> 0..total (0..40)
+    total = left_len + right_len
+
     pos = int(round((net - REP_MIN) / (REP_MAX - REP_MIN) * total))
     pos = clamp(pos, 0, total)
 
-    bar = ["-"] * (total + 1)  # 41 chars
-    center_idx = left_len       # 20
+    bar = ["-"] * (total + 1)
+    center_idx = left_len
     bar[center_idx] = "┃"
-    bar[pos] = "▲"              # overwrites ┃ if pos==center_idx (net==0) - OK
+    bar[pos] = "▲"
 
     bar_line = f"[{''.join(bar)}]"
 
-    # Align explainer's │ with bar's ┃ position.
     center_col = 1 + center_idx
     left_text = "FEARED ←"
     right_text = "→ LOVED"
@@ -219,17 +183,17 @@ def render_reputation_block(net_lifetime: int) -> str:
     pad_left = max(0, center_col - len(prefix))
     explainer = prefix + (" " * pad_left) + "│" + (" " * pad_left) + " " + right_text
 
-    return f"{explainer}\n{bar_line}"
+    return f"{explainer}
+{bar_line}"
 
-
-# -----------------------------
-# DATABASE
-# -----------------------------
 
 class Database:
     def __init__(self, dsn: str):
         self._dsn = dsn
         self._conn: Optional[psycopg.AsyncConnection] = None
+        self.characters_name_col: str = "character_name"
+        self.abilities_name_col: str = "ability_name"
+        self.abilities_level_col: str = "upgrade_level"
 
     async def connect(self) -> None:
         LOG.info("Connecting to PostgreSQL...")
@@ -264,8 +228,45 @@ class Database:
             await cur.execute(sql, params)
             return await cur.fetchone()
 
+    async def _has_column(self, table: str, column: str) -> bool:
+        row = await self._fetchone(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s AND column_name=%s
+            LIMIT 1;
+            """,
+            (table, column),
+        )
+        return bool(row)
+
+    async def detect_compat_columns(self) -> None:
+        if await self._has_column("characters", "character_name"):
+            self.characters_name_col = "character_name"
+        elif await self._has_column("characters", "name"):
+            self.characters_name_col = "name"
+        else:
+            self.characters_name_col = "character_name"
+
+        if await self._has_column("abilities", "ability_name"):
+            self.abilities_name_col = "ability_name"
+        elif await self._has_column("abilities", "ability"):
+            self.abilities_name_col = "ability"
+        else:
+            self.abilities_name_col = "ability_name"
+
+        if await self._has_column("abilities", "upgrade_level"):
+            self.abilities_level_col = "upgrade_level"
+        elif await self._has_column("abilities", "level"):
+            self.abilities_level_col = "level"
+        else:
+            self.abilities_level_col = "upgrade_level"
+
+        LOG.info(
+            "Schema compat detected: characters.%s, abilities.%s, abilities.%s",
+            self.characters_name_col, self.abilities_name_col, self.abilities_level_col,
+        )
+
     async def init_schema(self) -> None:
-        # NOTE: This bot NEVER drops tables.
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS players (
@@ -277,17 +278,22 @@ class Database:
             );
             """
         )
+
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS characters (
                 guild_id       BIGINT NOT NULL,
                 user_id        BIGINT NOT NULL,
-                character_name TEXT  NOT NULL,
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, user_id, character_name)
+                character_name TEXT  NULL,
+                name           TEXT  NULL,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS character_name TEXT;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS name TEXT;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS legacy_points (
@@ -302,6 +308,7 @@ class Database:
             );
             """
         )
+
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS stars (
@@ -315,19 +322,27 @@ class Database:
             );
             """
         )
+
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS abilities (
                 guild_id       BIGINT NOT NULL,
                 user_id        BIGINT NOT NULL,
                 character_name TEXT NOT NULL,
-                ability_name   TEXT NOT NULL,
+                ability_name   TEXT NULL,
+                ability        TEXT NULL,
                 upgrade_level  INT NOT NULL DEFAULT 0,
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, user_id, character_name, ability_name)
+                level          INT NULL,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS ability_name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS ability TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS upgrade_level INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS level INT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS dashboard_messages (
@@ -340,9 +355,10 @@ class Database:
             );
             """
         )
+
+        await self.detect_compat_columns()
         LOG.info("Database schema initialized / updated")
 
-    # players
     async def get_player_rank(self, guild_id: int, user_id: int) -> str:
         row = await self._fetchone("SELECT server_rank FROM players WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
         return row["server_rank"] if row and row.get("server_rank") else "Newcomer"
@@ -360,18 +376,13 @@ class Database:
             (guild_id, user_id, rank),
         )
 
-    async def list_player_ids(self, guild_id: int) -> List[int]:
-        rows = await self._fetchall("SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC;", (guild_id,))
-        return [int(r["user_id"]) for r in rows]
-
-    # characters
     async def add_character(self, guild_id: int, user_id: int, character_name: str) -> None:
         character_name = character_name.strip()
         if not character_name:
             raise ValueError("Character name cannot be empty.")
         await self._execute(
-            "INSERT INTO characters (guild_id, user_id, character_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
-            (guild_id, user_id, character_name),
+            "INSERT INTO characters (guild_id, user_id, character_name, name) VALUES (%s, %s, %s, %s);",
+            (guild_id, user_id, character_name, character_name),
         )
         await self._execute(
             "INSERT INTO legacy_points (guild_id, user_id, character_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
@@ -387,19 +398,37 @@ class Database:
         )
 
     async def get_character(self, guild_id: int, user_id: int, character_name: str) -> Optional[Dict[str, Any]]:
+        col = self.characters_name_col
         return await self._fetchone(
-            "SELECT character_name FROM characters WHERE guild_id=%s AND user_id=%s AND character_name=%s;",
+            f"SELECT {col} AS character_name FROM characters WHERE guild_id=%s AND user_id=%s AND {col}=%s LIMIT 1;",
             (guild_id, user_id, character_name.strip()),
         )
 
     async def list_characters(self, guild_id: int, user_id: int) -> List[str]:
-        rows = await self._fetchall(
-            "SELECT character_name FROM characters WHERE guild_id=%s AND user_id=%s ORDER BY created_at ASC, character_name ASC;",
-            (guild_id, user_id),
-        )
-        return [r["character_name"] for r in rows]
+        col = self.characters_name_col
+        try:
+            rows = await self._fetchall(
+                f"SELECT {col} AS character_name FROM characters WHERE guild_id=%s AND user_id=%s ORDER BY created_at ASC, {col} ASC;",
+                (guild_id, user_id),
+            )
+            return [r["character_name"] for r in rows if r.get("character_name")]
+        except pg_errors.UndefinedColumn:
+            fallback = "name" if col == "character_name" else "character_name"
+            rows = await self._fetchall(
+                f"SELECT {fallback} AS character_name FROM characters WHERE guild_id=%s AND user_id=%s ORDER BY created_at ASC, {fallback} ASC;",
+                (guild_id, user_id),
+            )
+            self.characters_name_col = fallback
+            return [r["character_name"] for r in rows if r.get("character_name")]
 
-    # legacy points
+    async def list_player_ids(self, guild_id: int) -> List[int]:
+        col = self.characters_name_col
+        rows = await self._fetchall(
+            f"SELECT DISTINCT user_id FROM characters WHERE guild_id=%s AND {col} IS NOT NULL ORDER BY user_id ASC;",
+            (guild_id,),
+        )
+        return [int(r["user_id"]) for r in rows]
+
     async def get_legacy(self, guild_id: int, user_id: int, character_name: str) -> Dict[str, int]:
         row = await self._fetchone(
             "SELECT avail_pos, avail_neg, life_pos, life_neg FROM legacy_points WHERE guild_id=%s AND user_id=%s AND character_name=%s;",
@@ -481,7 +510,6 @@ class Database:
         )
         return new
 
-    # stars
     async def get_stars(self, guild_id: int, user_id: int, character_name: str) -> Dict[str, int]:
         row = await self._fetchone(
             "SELECT ability_stars, infl_pos, infl_neg FROM stars WHERE guild_id=%s AND user_id=%s AND character_name=%s;",
@@ -527,13 +555,11 @@ class Database:
             if stars["infl_pos"] + stars["infl_neg"] >= MAX_INFL_STARS_TOTAL:
                 raise ValueError("Influence stars already at max total (5)")
             stars = await self.set_stars(guild_id, user_id, character_name, infl_pos=stars["infl_pos"] + 1)
-
         elif star_type == "influence_negative":
             legacy = await self.spend_legacy(guild_id, user_id, character_name, "negative", STAR_COST)
             if stars["infl_pos"] + stars["infl_neg"] >= MAX_INFL_STARS_TOTAL:
                 raise ValueError("Influence stars already at max total (5)")
             stars = await self.set_stars(guild_id, user_id, character_name, infl_neg=stars["infl_neg"] + 1)
-
         elif star_type == "ability":
             if pool not in ("positive", "negative"):
                 raise ValueError("For ability stars, pool must be positive or negative.")
@@ -541,23 +567,36 @@ class Database:
             if stars["ability_stars"] >= MAX_ABILITY_STARS:
                 raise ValueError("Ability stars already at max (5)")
             stars = await self.set_stars(guild_id, user_id, character_name, ability_stars=stars["ability_stars"] + 1)
-
         else:
             raise ValueError("star_type must be ability, influence_positive, or influence_negative")
 
         return legacy, stars
 
-    # abilities
     async def list_abilities(self, guild_id: int, user_id: int, character_name: str) -> List[Dict[str, Any]]:
-        return await self._fetchall(
-            """
-            SELECT ability_name, upgrade_level
-            FROM abilities
-            WHERE guild_id=%s AND user_id=%s AND character_name=%s
-            ORDER BY created_at ASC, ability_name ASC;
-            """,
-            (guild_id, user_id, character_name.strip()),
-        )
+        name_col = self.abilities_name_col
+        lvl_col = self.abilities_level_col
+        try:
+            return await self._fetchall(
+                f"""
+                SELECT {name_col} AS ability_name, COALESCE({lvl_col}, 0) AS upgrade_level
+                FROM abilities
+                WHERE guild_id=%s AND user_id=%s AND character_name=%s
+                ORDER BY created_at ASC, {name_col} ASC;
+                """,
+                (guild_id, user_id, character_name.strip()),
+            )
+        except pg_errors.UndefinedColumn:
+            self.abilities_name_col = "ability_name"
+            self.abilities_level_col = "upgrade_level"
+            return await self._fetchall(
+                """
+                SELECT ability_name AS ability_name, COALESCE(upgrade_level, 0) AS upgrade_level
+                FROM abilities
+                WHERE guild_id=%s AND user_id=%s AND character_name=%s
+                ORDER BY created_at ASC, ability_name ASC;
+                """,
+                (guild_id, user_id, character_name.strip()),
+            )
 
     async def add_ability(self, guild_id: int, user_id: int, character_name: str, ability_name: str) -> None:
         ability_name = ability_name.strip()
@@ -569,12 +608,8 @@ class Database:
         if len(existing) >= cap:
             raise ValueError(f"Ability capacity reached ({len(existing)}/{cap}). Earn more Ability Stars to add abilities.")
         await self._execute(
-            """
-            INSERT INTO abilities (guild_id, user_id, character_name, ability_name, upgrade_level)
-            VALUES (%s, %s, %s, %s, 0)
-            ON CONFLICT DO NOTHING;
-            """,
-            (guild_id, user_id, character_name.strip(), ability_name),
+            "INSERT INTO abilities (guild_id, user_id, character_name, ability_name, ability, upgrade_level) VALUES (%s, %s, %s, %s, %s, 0);",
+            (guild_id, user_id, character_name.strip(), ability_name, ability_name),
         )
 
     async def upgrade_ability(self, guild_id: int, user_id: int, character_name: str, ability_name: str, pool: str) -> Dict[str, Any]:
@@ -583,11 +618,14 @@ class Database:
         if pool not in ("positive", "negative"):
             raise ValueError("pool must be positive or negative")
 
+        name_col = self.abilities_name_col
+        lvl_col = self.abilities_level_col
         row = await self._fetchone(
-            """
-            SELECT upgrade_level
+            f"""
+            SELECT COALESCE({lvl_col}, 0) AS upgrade_level
             FROM abilities
-            WHERE guild_id=%s AND user_id=%s AND character_name=%s AND ability_name=%s;
+            WHERE guild_id=%s AND user_id=%s AND character_name=%s AND {name_col}=%s
+            LIMIT 1;
             """,
             (guild_id, user_id, character_name.strip(), ability_name),
         )
@@ -602,17 +640,13 @@ class Database:
 
         await self.spend_legacy(guild_id, user_id, character_name, pool, MINOR_UPGRADE_COST)
         new_level = cur_level + 1
+
         await self._execute(
-            """
-            UPDATE abilities
-            SET upgrade_level=%s
-            WHERE guild_id=%s AND user_id=%s AND character_name=%s AND ability_name=%s;
-            """,
-            (new_level, guild_id, user_id, character_name.strip(), ability_name),
+            f"UPDATE abilities SET {lvl_col}=%s, upgrade_level=%s WHERE guild_id=%s AND user_id=%s AND character_name=%s AND {name_col}=%s;",
+            (new_level, new_level, guild_id, user_id, character_name.strip(), ability_name),
         )
         return {"ability_name": ability_name, "upgrade_level": new_level, "max_upgrades": max_upgrades}
 
-    # dashboard messages
     async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
         row = await self._fetchone("SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
         return parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
@@ -632,10 +666,6 @@ class Database:
         await self._execute("DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
 
 
-# -----------------------------
-# DASHBOARD RENDERING
-# -----------------------------
-
 @dataclass
 class CharacterCard:
     character_name: str
@@ -653,7 +683,7 @@ async def build_character_card(db: Database, guild_id: int, user_id: int, charac
     legacy = await db.get_legacy(guild_id, user_id, character_name)
     stars = await db.get_stars(guild_id, user_id, character_name)
     abilities_rows = await db.list_abilities(guild_id, user_id, character_name)
-    abilities = [(r["ability_name"], safe_int(r.get("upgrade_level"), 0)) for r in abilities_rows]
+    abilities = [(r["ability_name"], safe_int(r.get("upgrade_level"), 0)) for r in abilities_rows if r.get("ability_name")]
     return CharacterCard(
         character_name=character_name,
         avail_pos=legacy["avail_pos"],
@@ -680,7 +710,8 @@ def render_character_block(card: CharacterCard) -> str:
         lines.append("Abilities: " + " | ".join(parts))
     else:
         lines.append("Abilities: _none set_")
-    return "\n".join(lines).strip()
+    return "
+".join(lines).strip()
 
 
 async def render_player_post(db: Database, guild: discord.Guild, user_id: int) -> str:
@@ -708,19 +739,19 @@ async def render_player_post(db: Database, guild: discord.Guild, user_id: int) -
 
     lines.append(PLAYER_BORDER)
 
-    content = "\n".join(lines).rstrip()
+    content = "
+".join(lines).rstrip()
     if len(content) > PLAYER_POST_SOFT_LIMIT:
         truncated = content[:PLAYER_POST_SOFT_LIMIT - 40]
-        cut = truncated.rfind("\n")
+        cut = truncated.rfind("
+")
         if cut > 0:
             truncated = truncated[:cut]
-        content = truncated.rstrip() + "\n\n…(truncated: too many characters to fit in one post)"
+        content = truncated.rstrip() + "
+
+…(truncated: too many characters to fit in one post)"
     return content
 
-
-# -----------------------------
-# DASHBOARD POSTING
-# -----------------------------
 
 async def get_dashboard_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     ch_id = safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID)
@@ -737,13 +768,7 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
     db = client.db
     channel = await get_dashboard_channel(guild)
     if not channel:
-        return f"Dashboard channel not found or not a text channel (ID {safe_int(os.getenv('DASHBOARD_CHANNEL_ID'), DEFAULT_DASHBOARD_CHANNEL_ID)})."
-
-    me = guild.me or (guild.get_member(client.user.id) if client.user else None)
-    if me:
-        perms = channel.permissions_for(me)
-        if not (perms.view_channel and perms.send_messages):
-            return f"Missing permissions in <#{channel.id}>: need View Channel + Send Messages."
+        return "Dashboard channel not found or not a text channel."
 
     chars = await db.list_characters(guild.id, user_id)
     if not chars:
@@ -758,9 +783,6 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
         return f"No characters for user_id={user_id}; dashboard entry cleared."
 
     content = await render_player_post(db, guild, user_id)
-    if not content:
-        return f"No content rendered for user_id={user_id}."
-
     stored_ids = await db.get_dashboard_message_ids(guild.id, user_id)
     msg: Optional[discord.Message] = None
     if stored_ids:
@@ -775,7 +797,6 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
         return f"Dashboard created for user_id={user_id}."
     else:
         await msg.edit(content=content)
-        # Clean up any extras from older versions that stored multiple IDs
         if len(stored_ids) > 1:
             for extra_id in stored_ids[1:]:
                 try:
@@ -797,40 +818,6 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
         ok += 1
     return f"Refreshed dashboards for {ok} player(s)."
 
-
-# -----------------------------
-# DISCORD CLIENT
-# -----------------------------
-
-class VilyraBotClient(discord.Client):
-    def __init__(self, db: Database, **kwargs: Any):
-        intents = discord.Intents.default()
-        intents.guilds = True
-        intents.members = True
-        super().__init__(intents=intents, **kwargs)
-        self.tree = app_commands.CommandTree(self)
-        self.db = db
-
-    async def setup_hook(self) -> None:
-        try:
-            await self.tree.sync()
-            LOG.info("Guild sync succeeded: %s commands", len(self.tree.get_commands()))
-        except Exception:
-            LOG.exception("Command sync failed")
-
-    async def on_ready(self) -> None:
-        LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
-        for g in list(self.guilds):
-            try:
-                status = await refresh_all_dashboards(self, g)
-                LOG.info("Startup dashboard refresh: %s", status)
-            except Exception:
-                LOG.exception("Startup dashboard refresh failed")
-
-
-# -----------------------------
-# CHECKS
-# -----------------------------
 
 def staff_only():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -857,249 +844,19 @@ async def require_character(db: Database, guild_id: int, user_id: int, character
         raise ValueError("Character not found for that user.")
 
 
-# -----------------------------
-# COMMANDS — STAFF
-# -----------------------------
-
-@app_commands.command(name="set_server_rank", description="(Staff) Set a player's server rank.")
+@app_commands.command(name="character_add", description="(Staff) Alias for /add_character (kept for compatibility).")
 @in_guild_only()
 @staff_only()
-async def set_server_rank(interaction: discord.Interaction, user: discord.Member, rank: str):
+async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        rank = rank.strip()
-        if rank not in SERVER_RANKS:
-            await safe_followup(interaction, f"Invalid rank. Options: {', '.join(SERVER_RANKS)}")
-            return
-        await run_db(interaction.client.db.set_player_rank(interaction.guild.id, user.id, rank), "set_server_rank")
-        await log_to_channel(interaction.guild, f"🏷️ {interaction.user.mention} set server rank for {user.mention} to **{rank}**")
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Rank set. {status}")
-    except Exception as e:
-        LOG.exception("set_server_rank failed")
-        await safe_followup(interaction, f"Set rank failed: {e}")
-
-
-@app_commands.command(name="add_character", description="(Staff) Add a character under a player.")
-@in_guild_only()
-@staff_only()
-async def add_character(interaction: discord.Interaction, user: discord.Member, character_name: str):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        await run_db(interaction.client.db.add_character(interaction.guild.id, user.id, character_name), "add_character")
-        await log_to_channel(interaction.guild, f"➕ {interaction.user.mention} added character **{character_name}** under {user.mention}")
+        await run_db(interaction.client.db.add_character(interaction.guild.id, user.id, character_name.strip()), "add_character")
         status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
         await safe_followup(interaction, f"Character added. {status}")
     except Exception as e:
-        LOG.exception("add_character failed")
         await safe_followup(interaction, f"Add character failed: {e}")
 
-
-@app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
-@in_guild_only()
-@staff_only()
-async def award_legacy_points(interaction: discord.Interaction, user: discord.Member, character_name: str, positive: int = 0, negative: int = 0):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        if positive < 0 or negative < 0:
-            await safe_followup(interaction, "Points must be >= 0.")
-            return
-        if positive == 0 and negative == 0:
-            await safe_followup(interaction, "Provide positive and/or negative points to award.")
-            return
-        new = await run_db(interaction.client.db.award_legacy(interaction.guild.id, user.id, character_name, pos=positive, neg=negative), "award_legacy")
-        await log_to_channel(
-            interaction.guild,
-            f"🏅 {interaction.user.mention} awarded **{character_name}** ({user.mention}) legacy points: +{positive} / -{negative} | now avail +{new['avail_pos']}/-{new['avail_neg']} life +{new['life_pos']}/-{new['life_neg']}",
-        )
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Awarded. {status}")
-    except Exception as e:
-        LOG.exception("award_legacy_points failed")
-        await safe_followup(interaction, f"Award failed: {e}")
-
-
-@app_commands.command(name="convert_star", description="(Staff) Convert legacy points to a star (cost: 10).")
-@in_guild_only()
-@staff_only()
-async def convert_star(interaction: discord.Interaction, user: discord.Member, character_name: str, star_type: str, pool: Optional[str] = None):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        star_type = star_type.strip().lower()
-        pool = pool.strip().lower() if pool else None
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        legacy, stars = await run_db(interaction.client.db.convert_star(interaction.guild.id, user.id, character_name, star_type, pool), "convert_star")
-        await log_to_channel(
-            interaction.guild,
-            f"⭐ {interaction.user.mention} converted points -> **{star_type}** for **{character_name}** ({user.mention}) | avail +{legacy['avail_pos']}/-{legacy['avail_neg']} | stars ability={stars['ability_stars']} infl -{stars['infl_neg']} +{stars['infl_pos']}",
-        )
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Converted. {status}")
-    except Exception as e:
-        LOG.exception("convert_star failed")
-        await safe_followup(interaction, f"Convert failed: {e}")
-
-
-@app_commands.command(name="add_ability", description="(Staff) Add an ability to a character (requires capacity from Ability Stars).")
-@in_guild_only()
-@staff_only()
-async def add_ability(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_name: str):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        ability_name = ability_name.strip()
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        await run_db(interaction.client.db.add_ability(interaction.guild.id, user.id, character_name, ability_name), "add_ability")
-        await log_to_channel(interaction.guild, f"🧩 {interaction.user.mention} added ability **{ability_name}** to **{character_name}** ({user.mention})")
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Ability added. {status}")
-    except Exception as e:
-        LOG.exception("add_ability failed")
-        await safe_followup(interaction, f"Add ability failed: {e}")
-
-
-@app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points to apply a minor ability upgrade.")
-@in_guild_only()
-@staff_only()
-async def upgrade_ability(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_name: str, pool: str):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        ability_name = ability_name.strip()
-        pool = pool.strip().lower()
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        res = await run_db(interaction.client.db.upgrade_ability(interaction.guild.id, user.id, character_name, ability_name, pool), "upgrade_ability")
-        await log_to_channel(
-            interaction.guild,
-            f"🔧 {interaction.user.mention} upgraded **{ability_name}** on **{character_name}** ({user.mention}) -> level {res['upgrade_level']} (max {res['max_upgrades']}); spent {MINOR_UPGRADE_COST} {pool} points",
-        )
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Upgraded to level {res['upgrade_level']}/{res['max_upgrades']}. {status}")
-    except Exception as e:
-        LOG.exception("upgrade_ability failed")
-        await safe_followup(interaction, f"Upgrade failed: {e}")
-
-
-@app_commands.command(name="reset_legacy_points", description="(Staff) Reset available and/or lifetime legacy point totals (for corrections).")
-@in_guild_only()
-@staff_only()
-async def reset_legacy_points(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    character_name: str,
-    target: str,
-    avail_pos: Optional[int] = None,
-    avail_neg: Optional[int] = None,
-    life_pos: Optional[int] = None,
-    life_neg: Optional[int] = None,
-):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        target = target.strip().lower()
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        new = await run_db(interaction.client.db.reset_legacy(interaction.guild.id, user.id, character_name, target, avail_pos, avail_neg, life_pos, life_neg), "reset_legacy")
-        await log_to_channel(
-            interaction.guild,
-            f"🧾 {interaction.user.mention} reset legacy points for **{character_name}** ({user.mention}) target={target} -> avail +{new['avail_pos']}/-{new['avail_neg']} life +{new['life_pos']}/-{new['life_neg']}",
-        )
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Reset complete. {status}")
-    except Exception as e:
-        LOG.exception("reset_legacy_points failed")
-        await safe_followup(interaction, f"Reset failed: {e}")
-
-
-@app_commands.command(name="reset_ability_stars", description="(Staff) Set a character's Ability Star total (0-5).")
-@in_guild_only()
-@staff_only()
-async def reset_ability_stars(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_stars: int):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        new = await run_db(interaction.client.db.set_stars(interaction.guild.id, user.id, character_name, ability_stars=ability_stars), "set_stars")
-        await log_to_channel(interaction.guild, f"🌟 {interaction.user.mention} set Ability Stars for **{character_name}** ({user.mention}) to {new['ability_stars']}")
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Ability Stars set to {new['ability_stars']}. {status}")
-    except Exception as e:
-        LOG.exception("reset_ability_stars failed")
-        await safe_followup(interaction, f"Reset failed: {e}")
-
-
-@app_commands.command(name="reset_influence_stars", description="(Staff) Set a character's Influence Stars (pos/neg; total max 5).")
-@in_guild_only()
-@staff_only()
-async def reset_influence_stars(interaction: discord.Interaction, user: discord.Member, character_name: str, positive: int, negative: int):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        new = await run_db(interaction.client.db.set_stars(interaction.guild.id, user.id, character_name, infl_pos=positive, infl_neg=negative), "set_stars")
-        await log_to_channel(interaction.guild, f"⚖️ {interaction.user.mention} set Influence Stars for **{character_name}** ({user.mention}) to -{new['infl_neg']} +{new['infl_pos']}")
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_followup(interaction, f"Influence Stars set. {status}")
-    except Exception as e:
-        LOG.exception("reset_influence_stars failed")
-        await safe_followup(interaction, f"Reset failed: {e}")
-
-
-@app_commands.command(name="refresh_dashboard", description="(Staff) Force refresh the whole dashboard.")
-@in_guild_only()
-@staff_only()
-async def refresh_dashboard(interaction: discord.Interaction):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        status = await refresh_all_dashboards(interaction.client, interaction.guild)
-        await log_to_channel(interaction.guild, f"🔄 {interaction.user.mention} refreshed the dashboard")
-        await safe_followup(interaction, status)
-    except Exception as e:
-        LOG.exception("refresh_dashboard failed")
-        await safe_followup(interaction, f"Refresh failed: {e}")
-
-
-# -----------------------------
-# COMMANDS — ANY USER
-# -----------------------------
-
-@app_commands.command(name="char_card", description="Show a character's card ephemerally.")
-@in_guild_only()
-async def char_card(interaction: discord.Interaction, character_name: str, user: Optional[discord.Member] = None):
-    await defer_ephemeral(interaction)
-    try:
-        assert interaction.guild is not None
-        character_name = character_name.strip()
-        target_user = user or interaction.user
-        if user is not None:
-            if not (isinstance(interaction.user, discord.Member) and is_staff(interaction.user)):
-                await safe_followup(interaction, "You can only look up your own characters.")
-                return
-
-        await run_db(require_character(interaction.client.db, interaction.guild.id, target_user.id, character_name), "require_character")
-        card = await run_db(build_character_card(interaction.client.db, interaction.guild.id, target_user.id, character_name), "build_character_card")
-        await safe_followup(interaction, render_character_block(card))
-    except Exception as e:
-        LOG.exception("char_card failed")
-        await safe_followup(interaction, f"Lookup failed: {e}")
-
-
-# -----------------------------
-# DISCORD CLIENT
-# -----------------------------
 
 class VilyraBotClient(discord.Client):
     def __init__(self, db: Database, **kwargs: Any):
@@ -1112,8 +869,11 @@ class VilyraBotClient(discord.Client):
 
     async def setup_hook(self) -> None:
         try:
-            await self.tree.sync()
-            LOG.info("Guild sync succeeded: %s commands", len(self.tree.get_commands()))
+            gid = safe_int(os.getenv("GUILD_ID"), 0)
+            if gid:
+                await self.tree.sync(guild=discord.Object(id=gid))
+            else:
+                await self.tree.sync()
         except Exception:
             LOG.exception("Command sync failed")
 
@@ -1121,50 +881,24 @@ class VilyraBotClient(discord.Client):
         LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
         for g in list(self.guilds):
             try:
-                status = await refresh_all_dashboards(self, g)
-                LOG.info("Startup dashboard refresh: %s", status)
+                await refresh_all_dashboards(self, g)
             except Exception:
                 LOG.exception("Startup dashboard refresh failed")
 
 
-# -----------------------------
-# MAIN
-# -----------------------------
-
 async def main_async() -> None:
     token = env("DISCORD_TOKEN")
     dsn = env("DATABASE_URL")
-
     db = Database(dsn)
     await db.connect()
     await db.init_schema()
-
     client = VilyraBotClient(db=db)
-
-    # Register commands
-    client.tree.add_command(set_server_rank)
-    client.tree.add_command(add_character)
-    client.tree.add_command(award_legacy_points)
-    client.tree.add_command(convert_star)
-    client.tree.add_command(add_ability)
-    client.tree.add_command(upgrade_ability)
-    client.tree.add_command(reset_legacy_points)
-    client.tree.add_command(reset_ability_stars)
-    client.tree.add_command(reset_influence_stars)
-    client.tree.add_command(refresh_dashboard)
-    client.tree.add_command(char_card)
-
-    try:
-        await client.start(token)
-    finally:
-        await db.close()
+    client.tree.add_command(character_add)
+    await client.start(token)
 
 
 def main() -> None:
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
