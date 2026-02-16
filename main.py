@@ -756,8 +756,10 @@ class Database:
         return new_level, max_level
 
     # -------- Dashboard message tracking --------
-async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional["datetime"]]:
-    """Return (message_ids, content_hash, dashboard_updated_at). Falls back gracefully if content_hash column doesn't exist yet."""
+# -------- Dashboard message tracking --------
+
+async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional[Any]]:
+    """Return (message_ids, content_hash, updated_at). Falls back gracefully if content_hash doesn't exist."""
     try:
         row = await self._fetchone(
             "SELECT message_ids, content_hash, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
@@ -768,7 +770,6 @@ async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[i
         ts = row["updated_at"] if row and row.get("updated_at") else None
         return ids, h, ts
     except psycopg.errors.UndefinedColumn:
-        # Older schema: dashboard_messages has no content_hash yet.
         row = await self._fetchone(
             "SELECT message_ids, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
             (guild_id, user_id),
@@ -777,55 +778,53 @@ async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[i
         ts = row["updated_at"] if row and row.get("updated_at") else None
         return ids, None, ts
 
-    async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
-        return ids
+async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
+    ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
+    return ids
 
-    async def set_dashboard_message_ids(
-        self,
-        guild_id: int,
-        user_id: int,
-        channel_id: int,
-        ids: List[int],
-        h: Optional[str] = None,
-    ) -> None:
-        """Persist dashboard message IDs (and optional content hash) for a player."""
-        try:
-            await self._execute(
-                """
-                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET channel_id=EXCLUDED.channel_id,
-                              message_ids=EXCLUDED.message_ids,
-                              content_hash=EXCLUDED.content_hash,
-                              updated_at=NOW();
-                """,
-                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
-            )
-        except psycopg.errors.UndefinedColumn:
-            # Older schema: no content_hash column yet.
-            await self._execute(
-                """
-                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET channel_id=EXCLUDED.channel_id,
-                              message_ids=EXCLUDED.message_ids,
-                              updated_at=NOW();
-                """,
-                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
-            )
-
-    async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
+async def set_dashboard_message_ids(
+    self,
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+    ids: List[int],
+    h: Optional[str] = None,
+) -> None:
+    """Persist dashboard message IDs (and optional content hash) for a player."""
+    try:
         await self._execute(
-            "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-            (guild_id, user_id),
+            """
+            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                          message_ids=EXCLUDED.message_ids,
+                          content_hash=EXCLUDED.content_hash,
+                          updated_at=NOW();
+            """,
+            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
+        )
+    except psycopg.errors.UndefinedColumn:
+        await self._execute(
+            """
+            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                          message_ids=EXCLUDED.message_ids,
+                          updated_at=NOW();
+            """,
+            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
         )
 
+async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
+    await self._execute(
+        "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+        (guild_id, user_id),
+    )
 
-async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -> Optional["datetime"]:
-    """Max updated_at across characters + abilities for this player in this guild."""
+async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -> Optional[Any]:
+    """Max updated_at across characters + abilities for this player."""
     row = await self._fetchone(
         """
         SELECT GREATEST(
@@ -835,93 +834,7 @@ async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -
         """,
         (guild_id, user_id, guild_id, user_id),
     )
-    ts = row["ts"] if row else None
-    return ts
-
-
-    
-    # -------- Dashboard message tracking --------
-
-    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str]]:
-        """Return (message_ids, content_hash). Falls back gracefully if content_hash column doesn't exist yet."""
-        try:
-            row = await self._fetchone(
-                "SELECT message_ids, content_hash FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-                (guild_id, user_id),
-            )
-            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
-            h = str(row["content_hash"]) if row and row.get("content_hash") else None
-            return ids, h
-        except psycopg.errors.UndefinedColumn:
-            row = await self._fetchone(
-                "SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-                (guild_id, user_id),
-            )
-            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
-            return ids, None
-
-    async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
-        return ids
-
-    async def set_dashboard_message_ids(
-        self,
-        guild_id: int,
-        user_id: int,
-        channel_id: int,
-        ids: List[int],
-        h: Optional[str] = None,
-    ) -> None:
-        """Persist dashboard message IDs (and optional content hash) for a player."""
-        try:
-            await self._execute(
-                """
-                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET channel_id=EXCLUDED.channel_id,
-                              message_ids=EXCLUDED.message_ids,
-                              content_hash=EXCLUDED.content_hash,
-                              updated_at=NOW();
-                """,
-                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
-            )
-        except psycopg.errors.UndefinedColumn:
-            # Older schema: no content_hash column yet.
-            await self._execute(
-                """
-                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET channel_id=EXCLUDED.channel_id,
-                              message_ids=EXCLUDED.message_ids,
-                              updated_at=NOW();
-                """,
-                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
-            )
-
-    async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
-        await self._execute(
-            "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-            (guild_id, user_id),
-        )
-
-# -----------------------------
-# Domain model + rendering
-# -----------------------------
-
-@dataclass
-class CharacterCard:
-    name: str
-    legacy_plus: int
-    legacy_minus: int
-    lifetime_plus: int
-    lifetime_minus: int
-    ability_stars: int
-    infl_plus: int
-    infl_minus: int
-    abilities: List[Tuple[str, int]]
-
+    return row["ts"] if row else None
 
 async def build_character_card(db: Database, guild_id: int, user_id: int, name: str) -> CharacterCard:
     st = await db.get_character_state(guild_id, user_id, name)
@@ -1387,6 +1300,7 @@ class VilyraBotClient(discord.Client):
         try:
             gid = safe_int(os.getenv("GUILD_ID"), 0)
             if gid:
+                self.tree.copy_global_to(guild=discord.Object(id=gid))
                 synced = await self.tree.sync(guild=discord.Object(id=gid))
                 LOG.info("Guild sync succeeded: %s commands", len(synced))
                 if len(synced)==0:
@@ -1397,6 +1311,7 @@ class VilyraBotClient(discord.Client):
                         try:
                             # As a last resort, clear guild commands and re-sync to resolve "outdated" command schemas.
                             self.tree.clear_commands(guild=discord.Object(id=gid))
+                            self.tree.copy_global_to(guild=discord.Object(id=gid))
                             synced3 = await self.tree.sync(guild=discord.Object(id=gid))
                             LOG.info("Guild re-sync after clear succeeded: %s commands", len(synced3))
                         except Exception as ex3:
