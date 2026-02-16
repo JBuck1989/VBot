@@ -756,27 +756,29 @@ class Database:
         return new_level, max_level
 
     # -------- Dashboard message tracking --------
-
-    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str]]:
-        """Return (message_ids, content_hash). Falls back gracefully if content_hash column doesn't exist yet."""
-        try:
-            row = await self._fetchone(
-                "SELECT message_ids, content_hash FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-                (guild_id, user_id),
-            )
-            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
-            h = str(row["content_hash"]) if row and row.get("content_hash") else None
-            return ids, h
-        except psycopg.errors.UndefinedColumn:
-            row = await self._fetchone(
-                "SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-                (guild_id, user_id),
-            )
-            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
-            return ids, None
+async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional["datetime"]]:
+    """Return (message_ids, content_hash, dashboard_updated_at). Falls back gracefully if content_hash column doesn't exist yet."""
+    try:
+        row = await self._fetchone(
+            "SELECT message_ids, content_hash, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+            (guild_id, user_id),
+        )
+        ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+        h = str(row["content_hash"]) if row and row.get("content_hash") else None
+        ts = row["updated_at"] if row and row.get("updated_at") else None
+        return ids, h, ts
+    except psycopg.errors.UndefinedColumn:
+        # Older schema: dashboard_messages has no content_hash yet.
+        row = await self._fetchone(
+            "SELECT message_ids, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+            (guild_id, user_id),
+        )
+        ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+        ts = row["updated_at"] if row and row.get("updated_at") else None
+        return ids, None, ts
 
     async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-        ids, _ = await self.get_dashboard_entry(guild_id, user_id)
+        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
         return ids
 
     async def set_dashboard_message_ids(
@@ -822,6 +824,20 @@ class Database:
         )
 
 
+async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -> Optional["datetime"]:
+    """Max updated_at across characters + abilities for this player in this guild."""
+    row = await self._fetchone(
+        """
+        SELECT GREATEST(
+            COALESCE((SELECT MAX(updated_at) FROM characters WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
+            COALESCE((SELECT MAX(updated_at) FROM abilities WHERE guild_id=%s AND user_id=%s), to_timestamp(0))
+        ) AS ts
+        """,
+        (guild_id, user_id, guild_id, user_id),
+    )
+    ts = row["ts"] if row else None
+    return ts
+
 
     
     # -------- Dashboard message tracking --------
@@ -845,7 +861,7 @@ class Database:
             return ids, None
 
     async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-        ids, _ = await self.get_dashboard_entry(guild_id, user_id)
+        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
         return ids
 
     async def set_dashboard_message_ids(
@@ -1001,7 +1017,16 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
             return f"Missing permissions in <#{channel.id}>: need View Channel + Send Messages."
 
     chars = await db.list_characters(guild.id, user_id)
-    stored_ids, stored_hash = await db.get_dashboard_entry(guild.id, user_id)
+    stored_ids, stored_hash, dash_ts = await db.get_dashboard_entry(guild.id, user_id)
+
+# Skip startup refresh for this player if nothing changed since last dashboard update.
+try:
+    latest_ts = await db.get_latest_player_data_updated_at(guild.id, user_id)
+    if dash_ts and latest_ts and latest_ts <= dash_ts:
+        LOG.info("Dashboard up-to-date for user_id=%s (latest_ts=%s <= dash_ts=%s); skipping.", user_id, latest_ts, dash_ts)
+        return "skipped"
+except Exception as ex:
+    LOG.warning("Could not compute latest player data timestamp for user_id=%s: %s", user_id, ex)
 
     if not chars:
         for mid in stored_ids:
@@ -1359,6 +1384,13 @@ class VilyraBotClient(discord.Client):
             if gid:
                 synced = await self.tree.sync(guild=discord.Object(id=gid))
                 LOG.info("Guild sync succeeded: %s commands", len(synced))
+                if len(synced)==0:
+                    LOG.warning("Guild sync returned 0 commands; attempting global sync fallback...")
+                    try:
+                        synced2 = await self.tree.sync()
+                        LOG.info("Global sync fallback succeeded: %s commands", len(synced2))
+                    except Exception as ex2:
+                        LOG.exception("Global sync fallback failed: %s", ex2)
                 if len(synced)==0:
                     LOG.warning("Guild sync returned 0 commands. Check GUILD_ID, bot invite scopes (applications.commands), and that commands are not pending global propagation.")
             else:
