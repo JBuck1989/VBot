@@ -602,6 +602,27 @@ class VilyraBot(discord.Client):
         intents.guilds = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+
+# Register all app commands declared below with @app_commands.command
+for cmd in (
+    character_create,
+    character_archive,
+    character_delete,
+    rank_set,
+    legacy_add,
+    legacy_remove,
+    ability_stars_set,
+    influence_stars_set,
+    ability_add,
+    ability_upgrade,
+    refresh_dashboard,
+    card,
+):
+    try:
+        self.tree.add_command(cmd)
+    except Exception:
+        # Avoid hard-crashing if Discord caches an older signature during rapid deploys.
+        pass
         self.db = db
 
     async def setup_hook(self) -> None:
@@ -753,7 +774,7 @@ def require_guardian_warden():
     return app_commands.check(predicate)
 
 
-@VilyraBot.tree.command(name="character_create", description="Create (or unarchive) a character for a user.")
+@app_commands.command(name="character_create", description="Create (or unarchive) a character for a user.")
 @require_guardian_warden()
 @app_commands.describe(member="Owner of the character", name="Character name")
 async def character_create(interaction: discord.Interaction, member: discord.Member, name: str):
@@ -766,7 +787,7 @@ async def character_create(interaction: discord.Interaction, member: discord.Mem
     await interaction.followup.send(f"✅ Character **{name_n}** created/unarchived for **{member.display_name}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="character_archive", description="Archive or unarchive a character (removes/shows it on the dashboard).")
+@app_commands.command(name="character_archive", description="Archive or unarchive a character (removes/shows it on the dashboard).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner of the character", name="Character name", archived="True to archive, False to unarchive")
 async def character_archive(interaction: discord.Interaction, member: discord.Member, name: str, archived: bool):
@@ -779,7 +800,7 @@ async def character_archive(interaction: discord.Interaction, member: discord.Me
     await interaction.followup.send(f"✅ Archived={archived} for **{name_n}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="character_delete", description="Delete a character permanently (also deletes its abilities).")
+@app_commands.command(name="character_delete", description="Delete a character permanently (also deletes its abilities).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner of the character", name="Character name")
 async def character_delete(interaction: discord.Interaction, member: discord.Member, name: str):
@@ -792,7 +813,7 @@ async def character_delete(interaction: discord.Interaction, member: discord.Mem
     await interaction.followup.send(f"✅ Deleted **{name_n}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="rank_set", description="Set a player's server rank (stored and shown on their dashboard post).")
+@app_commands.command(name="rank_set", description="Set a player's server rank (stored and shown on their dashboard post).")
 @require_guardian_warden()
 @app_commands.describe(member="The member to set rank for", rank="Rank text (e.g., Guardian, Warden, etc.)")
 async def rank_set(interaction: discord.Interaction, member: discord.Member, rank: str):
@@ -805,7 +826,7 @@ async def rank_set(interaction: discord.Interaction, member: discord.Member, ran
     await interaction.followup.send(f"✅ Rank set to **{rank_clean}** for **{member.display_name}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="legacy_add", description="Add legacy points to a character (also increments lifetime).")
+@app_commands.command(name="legacy_add", description="Add legacy points to a character (also increments lifetime).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner", name="Character name", plus="Positive points to add", minus="Negative points to add")
 async def legacy_add(interaction: discord.Interaction, member: discord.Member, name: str, plus: int = 0, minus: int = 0):
@@ -820,7 +841,7 @@ async def legacy_add(interaction: discord.Interaction, member: discord.Member, n
     await interaction.followup.send(f"✅ Added to **{name_n}**: +{plus_i} / -{minus_i}.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="legacy_remove", description="Remove legacy points from current totals (does not change lifetime).")
+@app_commands.command(name="legacy_remove", description="Remove legacy points from current totals (does not change lifetime).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner", name="Character name", plus="Positive points to remove", minus="Negative points to remove")
 async def legacy_remove(interaction: discord.Interaction, member: discord.Member, name: str, plus: int = 0, minus: int = 0):
@@ -835,7 +856,7 @@ async def legacy_remove(interaction: discord.Interaction, member: discord.Member
     await interaction.followup.send(f"✅ Removed from **{name_n}**: +{plus_i} / -{minus_i} (clamped at 0).", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="ability_stars_set", description="Set total ability stars for a character (0–5).")
+@app_commands.command(name="ability_stars_set", description="Set total ability stars for a character (0–5).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner", name="Character name", stars="Total ability stars (0-5)")
 async def ability_stars_set(interaction: discord.Interaction, member: discord.Member, name: str, stars: int):
@@ -849,7 +870,7 @@ async def ability_stars_set(interaction: discord.Interaction, member: discord.Me
     await interaction.followup.send(f"✅ Ability stars for **{name_n}** set to **{stars_i}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="influence_stars_set", description="Set influence stars for a character (total max 5; split +/-).")
+@app_commands.command(name="influence_stars_set", description="Set influence stars for a character (total max 5; split +/-).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner", name="Character name", minus="Negative influence stars (0-5)", plus="Positive influence stars (0-5)")
 async def influence_stars_set(interaction: discord.Interaction, member: discord.Member, name: str, minus: int, plus: int):
@@ -867,7 +888,7 @@ async def influence_stars_set(interaction: discord.Interaction, member: discord.
     await interaction.followup.send(f"✅ Influence stars for **{name_n}** set to -{minus_i} / +{plus_i}.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="ability_add", description="Add a custom ability to a character (max 7).")
+@app_commands.command(name="ability_add", description="Add a custom ability to a character (max 7).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner", character="Character name", ability="Ability name")
 async def ability_add(interaction: discord.Interaction, member: discord.Member, character: str, ability: str):
@@ -888,7 +909,7 @@ async def ability_add(interaction: discord.Interaction, member: discord.Member, 
     await interaction.followup.send(f"✅ Added ability **{a}** to **{c}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="ability_upgrade", description="Adjust upgrades for a character ability (+1/-1 etc).")
+@app_commands.command(name="ability_upgrade", description="Adjust upgrades for a character ability (+1/-1 etc).")
 @require_guardian_warden()
 @app_commands.describe(member="Owner", character="Character name", ability="Ability name", delta="Change in upgrades (e.g., 1 or -1)")
 async def ability_upgrade(interaction: discord.Interaction, member: discord.Member, character: str, ability: str, delta: int):
@@ -903,7 +924,7 @@ async def ability_upgrade(interaction: discord.Interaction, member: discord.Memb
     await interaction.followup.send(f"✅ Updated **{a}** upgrades by {d} on **{c}**.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="refresh_dashboard", description="Refresh the dashboard now.")
+@app_commands.command(name="refresh_dashboard", description="Refresh the dashboard now.")
 @require_guardian_warden()
 async def refresh_dashboard(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -912,7 +933,7 @@ async def refresh_dashboard(interaction: discord.Interaction):
     await interaction.followup.send("✅ Dashboard refreshed.", ephemeral=True)
 
 
-@VilyraBot.tree.command(name="card", description="Show your character card (ephemeral).")
+@app_commands.command(name="card", description="Show your character card (ephemeral).")
 @app_commands.describe(name="Your character name")
 async def card(interaction: discord.Interaction, name: str):
     await interaction.response.defer(ephemeral=True)
