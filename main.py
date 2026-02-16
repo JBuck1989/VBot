@@ -492,6 +492,7 @@ async def build_character_snapshot(db: Database, guild_id: int, user_id: int, ro
 def render_character_block(c: CharacterSnapshot) -> str:
     lines: List[str] = []
     lines.append(fmt_character_header(c.name))
+    lines.append("")
     lines.append(f"Legacy Points: +{c.legacy_plus} / -{c.legacy_minus}  ·  Lifetime: +{c.lifetime_plus} / -{c.lifetime_minus}")
     lines.append(f"Ability Stars: {render_ability_stars(c.ability_stars)}")
     lines.append(f"Influence Stars: {render_influence_stars(c.influence_minus, c.influence_plus)}")
