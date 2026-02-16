@@ -30,6 +30,8 @@ MINOR_UPGRADE_COST = 5
 REP_MIN = -100
 REP_MAX = 100
 
+
+DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "1.2"))
 PLAYER_POST_SOFT_LIMIT = 1900
 
 SERVER_RANKS = [
@@ -143,6 +145,28 @@ async def log_to_channel(guild: Optional[discord.Guild], text: str) -> None:
             await ch.send(text, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         LOG.exception("Failed to write to command log channel")
+
+class SimpleRateLimiter:
+    """Serialize dashboard message edits/creates to reduce 429s.
+    discord.py will still handle rate limits, but this prevents burst PATCH spam at startup."""
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = max(0.0, float(min_interval))
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+
+    async def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            wait_for = (self._last + self.min_interval) - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            self._last = asyncio.get_running_loop().time()
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
 # -----------------------------
@@ -361,6 +385,7 @@ class Database:
                 user_id       BIGINT NOT NULL,
                 channel_id    BIGINT NOT NULL,
                 message_ids   TEXT,
+                content_hash  TEXT,
                 updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (guild_id, user_id)
             );
@@ -689,19 +714,25 @@ class Database:
 
     # -------- Dashboard message tracking --------
 
+    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str]]:
+        row = await self._fetchone("SELECT message_ids, content_hash FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
+        ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+        h = str(row["content_hash"]) if row and row.get("content_hash") else None
+        return ids, h
+
     async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
         row = await self._fetchone("SELECT message_ids FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
         return parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
 
-    async def set_dashboard_message_ids(self, guild_id: int, user_id: int, channel_id: int, ids: List[int]) -> None:
+    async def set_dashboard_message_ids(self, guild_id: int, user_id: int, channel_id: int, ids: List[int], h: Optional[str] = None) -> None:
         await self._execute(
             """
-            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
-            VALUES (%s, %s, %s, %s, NOW())
+            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET channel_id=EXCLUDED.channel_id, message_ids=EXCLUDED.message_ids, updated_at=NOW();
+            DO UPDATE SET channel_id=EXCLUDED.channel_id, message_ids=EXCLUDED.message_ids, content_hash=EXCLUDED.content_hash, updated_at=NOW();
             """,
-            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
+            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
         )
 
     async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
@@ -819,7 +850,7 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
             return f"Missing permissions in <#{channel.id}>: need View Channel + Send Messages."
 
     chars = await db.list_characters(guild.id, user_id)
-    stored_ids = await db.get_dashboard_message_ids(guild.id, user_id)
+    stored_ids, stored_hash = await db.get_dashboard_entry(guild.id, user_id)
 
     if not chars:
         for mid in stored_ids:
@@ -835,6 +866,8 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
     if not content:
         return f"No content rendered for user_id={user_id}."
 
+    new_hash = content_hash(content)
+
     msg: Optional[discord.Message] = None
     if stored_ids:
         try:
@@ -843,10 +876,12 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
             msg = None
 
     if msg is None:
+        await client.dashboard_limiter.wait()
         msg = await channel.send(content)
-        await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id])
+        await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id], new_hash)
         return f"Dashboard created for user_id={user_id}."
     else:
+        await client.dashboard_limiter.wait()
         await msg.edit(content=content)
         if len(stored_ids) > 1:
             for extra_id in stored_ids[1:]:
@@ -855,7 +890,8 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
                     await extra_msg.delete()
                 except Exception:
                     pass
-            await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id])
+            await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id], new_hash)
+        await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id], new_hash)
         return f"Dashboard updated for user_id={user_id}."
 
 
@@ -867,6 +903,8 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
     for uid in user_ids:
         await refresh_player_dashboard(client, guild, uid)
         ok += 1
+        # gentle spacing between players (prevents burst edits on startup)
+        await asyncio.sleep(0.2)
     return f"Refreshed dashboards for {ok} player(s)."
 
 
@@ -1115,6 +1153,7 @@ class VilyraBotClient(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.db = db
+        self.dashboard_limiter = SimpleRateLimiter(DASHBOARD_EDIT_MIN_INTERVAL)
 
     async def setup_hook(self) -> None:
         # Register commands
