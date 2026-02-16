@@ -196,8 +196,7 @@ def render_reputation_block(net_lifetime: int) -> str:
     spaces = max(1, len(bar_line) - len(left_text) - len(right_text))
     explainer = left_text + (" " * spaces) + right_text
 
-    return explainer + "
-" + bar_line
+    return explainer + "\n" + bar_line
 
 
 
@@ -1182,3 +1181,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
