@@ -1189,13 +1189,69 @@ async def character_archive(
     # Command log
     verb = "archived" if do_archive else "unarchived"
     await log_to_channel(
-        interaction.client,
-        COMMAND_LOG_CHANNEL_ID,
+        interaction.guild,
         f"🗄 {interaction.user.mention} {verb} **{character_name}** for {user.mention}",
     )
 
     await interaction.followup.send(f"✅ {verb.title()} **{character_name}**. {status}", ephemeral=True)
 
+
+
+
+@app_commands.command(name="character_archive_by_id", description="(Staff) Archive/unarchive a character by user ID (use for players who left).")
+@in_guild_only()
+@staff_only()
+@app_commands.describe(
+    user_id="Discord user ID of the player (numbers only).",
+    character_name="Exact character name to archive/unarchive.",
+    action="Archive hides the character from the dashboard; Unarchive shows it again.",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Archive", value="archive"),
+        app_commands.Choice(name="Unarchive", value="unarchive"),
+    ]
+)
+async def character_archive_by_id(
+    interaction: discord.Interaction,
+    user_id: str,
+    character_name: str,
+    action: app_commands.Choice[str],
+):
+    """
+    Archive/unarchive a character when you can't pick the user via Discord's user picker (e.g., they left the server).
+    """
+    await defer_ephemeral(interaction)
+
+    uid_str = (user_id or "").strip()
+    if not uid_str.isdigit():
+        await interaction.followup.send("❌ `user_id` must be numbers only (a Discord user ID).", ephemeral=True)
+        return
+    uid = int(uid_str)
+
+    do_archive = (action.value == "archive")
+    try:
+        status = await run_db(
+            interaction.client.db.set_character_archived(interaction.guild.id, uid, character_name, do_archive),
+            "set_character_archived",
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Archive failed: {e}", ephemeral=True)
+        return
+
+    # Update dashboard for that user id (even if the user isn't in guild anymore, the post is keyed by user_id)
+    try:
+        dash_status = await refresh_player_dashboard(interaction.client, interaction.guild, uid)
+    except Exception as e:
+        dash_status = f"(Dashboard refresh failed: {e})"
+
+    verb = "archived" if do_archive else "unarchived"
+    await log_to_channel(
+        interaction.guild,
+        f"🗄 {interaction.user.mention} {verb} **{character_name}** for user_id={uid}",
+    )
+
+    await interaction.followup.send(f"✅ {verb.title()} **{character_name}** for user_id={uid}. {dash_status}", ephemeral=True)
 
 @app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
 @in_guild_only()
@@ -1313,6 +1369,7 @@ async def staff_commands(interaction: discord.Interaction):
     items: list[tuple[str, str]] = [
         ("/character_add", "Add a new character for a player."),
         ("/character_archive", "Archive or unarchive a character (hide/show on the dashboard)."),
+        ("/character_archive_by_id", "Archive/unarchive by user ID (for players who left the server)."),
         ("/award_points", "Award legacy points to a character (positive or negative)."),
         ("/add_ability", "Add a new ability to a character (does not spend stars)."),
         ("/upgrade_ability", "Upgrade an existing ability (costs legacy points; max 5 upgrades)."),
@@ -1515,6 +1572,7 @@ class VilyraBotClient(discord.Client):
             "convert_points_to_stars",
             "staff_commands",
             "character_archive",
+            "character_archive_by_id",
         ]
         present = {c.name for c in self.tree.get_commands()}
         missing_cmds = [c for c in required_commands if c not in present]
@@ -1531,6 +1589,7 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(add_character)
         self.tree.add_command(character_add)
         self.tree.add_command(character_archive)
+        self.tree.add_command(character_archive_by_id)
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
         self.tree.add_command(convert_points_to_stars)
