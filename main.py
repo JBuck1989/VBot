@@ -528,41 +528,92 @@ class Database:
         else:
             raise ValueError("pool must be positive or negative")
 
-    async def convert_star(self, guild_id: int, user_id: int, name: str, star_type: str, pool: Optional[str]) -> None:
-        star_type = star_type.strip().lower()
-        pool = pool.strip().lower() if pool else None
-        st = await self.get_character_state(guild_id, user_id, name)
+async def convert_star(
+    self,
+    guild_id: int,
+    user_id: int,
+    name: str,
+    star_type: str,
+    stars: int,
+    spend_plus: int,
+    spend_minus: int,
+) -> None:
+    """
+    Convert AVAILABLE legacy points into stars (stars are assigned, never consumed).
+    Costs:
+      - ability star: 10 total points (can split + and -)
+      - influence_positive star: 10 positive points each
+      - influence_negative star: 10 negative points each
+    Caps:
+      - ability stars max 5
+      - total influence stars (pos+neg) max 5
+    """
+    star_type = star_type.strip().lower()
+    name = name.strip()
+    stars = int(stars)
+    spend_plus = int(spend_plus)
+    spend_minus = int(spend_minus)
 
-        infl_total = st["influence_plus"] + st["influence_minus"]
+    if stars < 1:
+        raise ValueError("stars must be >= 1.")
+    if spend_plus < 0 or spend_minus < 0:
+        raise ValueError("Spend values must be >= 0.")
 
-        if star_type == "influence_positive":
-            await self.spend_legacy(guild_id, user_id, name, "positive", STAR_COST)
-            if infl_total >= MAX_INFL_STARS_TOTAL:
-                raise ValueError("Influence stars already at max total (5).")
-            await self._execute(
-                "UPDATE characters SET influence_plus=influence_plus+1, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
-                (guild_id, user_id, name.strip()),
-            )
-        elif star_type == "influence_negative":
-            await self.spend_legacy(guild_id, user_id, name, "negative", STAR_COST)
-            if infl_total >= MAX_INFL_STARS_TOTAL:
-                raise ValueError("Influence stars already at max total (5).")
-            await self._execute(
-                "UPDATE characters SET influence_minus=influence_minus+1, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
-                (guild_id, user_id, name.strip()),
-            )
-        elif star_type == "ability":
-            if pool not in ("positive", "negative"):
-                raise ValueError("For ability stars, pool must be positive or negative.")
-            await self.spend_legacy(guild_id, user_id, name, pool, STAR_COST)
-            if st["ability_stars"] >= MAX_ABILITY_STARS:
-                raise ValueError("Ability stars already at max (5).")
-            await self._execute(
-                "UPDATE characters SET ability_stars=ability_stars+1, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
-                (guild_id, user_id, name.strip()),
-            )
-        else:
-            raise ValueError("star_type must be ability, influence_positive, or influence_negative")
+    st = await self.get_character_state(guild_id, user_id, name)
+    infl_total = st["influence_plus"] + st["influence_minus"]
+
+    total_cost = STAR_COST * stars
+
+    # Validate/cap target
+    if star_type == "ability":
+        if st["ability_stars"] + stars > MAX_ABILITY_STARS:
+            raise ValueError("Ability stars already at max (5).")
+        # ability stars can be purchased with ANY mix totaling 10 per star
+        if spend_plus + spend_minus != total_cost:
+            raise ValueError(f"Ability stars cost {total_cost} total points. Provide spend_plus + spend_minus = {total_cost}.")
+    elif star_type == "influence_positive":
+        if infl_total + stars > MAX_INFL_STARS_TOTAL:
+            raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+        # positive influence stars must be paid with positive points only
+        if spend_plus != total_cost or spend_minus != 0:
+            raise ValueError(f"Positive influence stars cost {total_cost} POSITIVE points. Provide spend_plus={total_cost}, spend_minus=0.")
+    elif star_type == "influence_negative":
+        if infl_total + stars > MAX_INFL_STARS_TOTAL:
+            raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+        # negative influence stars must be paid with negative points only
+        if spend_minus != total_cost or spend_plus != 0:
+            raise ValueError(f"Negative influence stars cost {total_cost} NEGATIVE points. Provide spend_plus=0, spend_minus={total_cost}.")
+    else:
+        raise ValueError("star_type must be ability, influence_positive, or influence_negative")
+
+    # Validate available pools
+    if spend_plus > st["legacy_plus"]:
+        raise ValueError(f"Not enough available positive points (need {spend_plus}, have {st['legacy_plus']}).")
+    if spend_minus > st["legacy_minus"]:
+        raise ValueError(f"Not enough available negative points (need {spend_minus}, have {st['legacy_minus']}).")
+
+    # Spend ONLY from AVAILABLE pools
+    await self._execute(
+        "UPDATE characters SET legacy_plus=legacy_plus-%s, legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+        (spend_plus, spend_minus, guild_id, user_id, name),
+    )
+
+    # Apply stars
+    if star_type == "ability":
+        await self._execute(
+            "UPDATE characters SET ability_stars=ability_stars+%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (stars, guild_id, user_id, name),
+        )
+    elif star_type == "influence_positive":
+        await self._execute(
+            "UPDATE characters SET influence_plus=influence_plus+%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (stars, guild_id, user_id, name),
+        )
+    else:  # influence_negative
+        await self._execute(
+            "UPDATE characters SET influence_minus=influence_minus+%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (stars, guild_id, user_id, name),
+        )
 
     async def reset_points(self, guild_id: int, user_id: int, name: str,
                            legacy_plus: Optional[int], legacy_minus: Optional[int],
@@ -1118,17 +1169,43 @@ async def award_legacy_points(interaction: discord.Interaction, user: discord.Me
         await safe_reply(interaction, f"Award failed: {e}")
 
 
-@app_commands.command(name="convert_star", description="(Staff) Convert legacy points to a star (cost: 10).")
+@app_commands.command(name="convert_star", description="(Staff) Convert available legacy points into stars (10 points per star).")
 @in_guild_only()
 @staff_only()
-async def convert_star(interaction: discord.Interaction, user: discord.Member, character_name: str, star_type: str, pool: Optional[str] = None):
+async def convert_star(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    star_type: str,
+    stars: int,
+    spend_positive: int,
+    spend_negative: int,
+):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
         character_name = character_name.strip()
+        star_type = star_type.strip().lower()
+
         await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
-        await run_db(interaction.client.db.convert_star(interaction.guild.id, user.id, character_name, star_type, pool), "convert_star")
-        await log_to_channel(interaction.guild, f"⭐ {interaction.user.mention} converted points -> **{star_type}** for **{character_name}** ({user.mention})")
+
+        await run_db(
+            interaction.client.db.convert_star(
+                interaction.guild.id,
+                user.id,
+                character_name,
+                star_type,
+                stars,
+                spend_positive,
+                spend_negative,
+            ),
+            "convert_star",
+        )
+
+        await log_to_channel(
+            interaction.guild,
+            f"⭐ {interaction.user.mention} converted legacy -> **{star_type}** x{stars} for **{character_name}** ({user.mention}) (spent +{spend_positive}/-{spend_negative})",
+        )
         status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
         await safe_reply(interaction, "Converted. " + status)
     except Exception as e:
