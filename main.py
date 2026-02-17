@@ -756,85 +756,87 @@ class Database:
         return new_level, max_level
 
     # -------- Dashboard message tracking --------
-# -------- Dashboard message tracking --------
 
-async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional[Any]]:
-    """Return (message_ids, content_hash, updated_at). Falls back gracefully if content_hash doesn't exist."""
-    try:
-        row = await self._fetchone(
-            "SELECT message_ids, content_hash, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional[Any]]:
+        """Return (message_ids, content_hash, updated_at). Falls back gracefully if content_hash doesn't exist."""
+        try:
+            row = await self._fetchone(
+                "SELECT message_ids, content_hash, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                (guild_id, user_id),
+            )
+            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+            h = str(row["content_hash"]) if row and row.get("content_hash") else None
+            ts = row["updated_at"] if row and row.get("updated_at") else None
+            return ids, h, ts
+        except psycopg.errors.UndefinedColumn:
+            row = await self._fetchone(
+                "SELECT message_ids, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                (guild_id, user_id),
+            )
+            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+            ts = row["updated_at"] if row and row.get("updated_at") else None
+            return ids, None, ts
+
+    async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
+        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
+        return ids
+
+    async def set_dashboard_message_ids(
+        self,
+        guild_id: int,
+        user_id: int,
+        channel_id: int,
+        ids: List[int],
+        h: Optional[str] = None,
+    ) -> None:
+        """Persist dashboard message IDs (and optional content hash) for a player."""
+        try:
+            await self._execute(
+                """
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                              message_ids=EXCLUDED.message_ids,
+                              content_hash=EXCLUDED.content_hash,
+                              updated_at=NOW();
+                """,
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
+            )
+        except psycopg.errors.UndefinedColumn:
+            await self._execute(
+                """
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                              message_ids=EXCLUDED.message_ids,
+                              updated_at=NOW();
+                """,
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
+            )
+
+    async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
+        await self._execute(
+            "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
             (guild_id, user_id),
         )
-        ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
-        h = str(row["content_hash"]) if row and row.get("content_hash") else None
-        ts = row["updated_at"] if row and row.get("updated_at") else None
-        return ids, h, ts
-    except psycopg.errors.UndefinedColumn:
+
+    async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -> Optional[Any]:
+        """Max updated_at across characters + abilities for this player."""
         row = await self._fetchone(
-            "SELECT message_ids, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-            (guild_id, user_id),
-        )
-        ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
-        ts = row["updated_at"] if row and row.get("updated_at") else None
-        return ids, None, ts
-
-async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-    ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
-    return ids
-
-async def set_dashboard_message_ids(
-    self,
-    guild_id: int,
-    user_id: int,
-    channel_id: int,
-    ids: List[int],
-    h: Optional[str] = None,
-) -> None:
-    """Persist dashboard message IDs (and optional content hash) for a player."""
-    try:
-        await self._execute(
             """
-            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET channel_id=EXCLUDED.channel_id,
-                          message_ids=EXCLUDED.message_ids,
-                          content_hash=EXCLUDED.content_hash,
-                          updated_at=NOW();
+            SELECT GREATEST(
+                COALESCE((SELECT MAX(updated_at) FROM characters WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
+                COALESCE((SELECT MAX(updated_at) FROM abilities WHERE guild_id=%s AND user_id=%s), to_timestamp(0))
+            ) AS ts
             """,
-            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
+            (guild_id, user_id, guild_id, user_id),
         )
-    except psycopg.errors.UndefinedColumn:
-        await self._execute(
-            """
-            INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (guild_id, user_id)
-            DO UPDATE SET channel_id=EXCLUDED.channel_id,
-                          message_ids=EXCLUDED.message_ids,
-                          updated_at=NOW();
-            """,
-            (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
-        )
+        return row["ts"] if row else None
 
-async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
-    await self._execute(
-        "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
-        (guild_id, user_id),
-    )
 
-async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -> Optional[Any]:
-    """Max updated_at across characters + abilities for this player."""
-    row = await self._fetchone(
-        """
-        SELECT GREATEST(
-            COALESCE((SELECT MAX(updated_at) FROM characters WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
-            COALESCE((SELECT MAX(updated_at) FROM abilities WHERE guild_id=%s AND user_id=%s), to_timestamp(0))
-        ) AS ts
-        """,
-        (guild_id, user_id, guild_id, user_id),
-    )
-    return row["ts"] if row else None
+    # -------- Dashboard message tracking --------
 
 async def build_character_card(db: Database, guild_id: int, user_id: int, name: str) -> CharacterCard:
     st = await db.get_character_state(guild_id, user_id, name)
