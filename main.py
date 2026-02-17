@@ -564,39 +564,6 @@ class Database:
         else:
             raise ValueError("star_type must be ability, influence_positive, or influence_negative")
 
-async def award_legacy_points(
-    self,
-    guild_id: int,
-    user_id: int,
-    character_name: str,
-    amount: int,
-    polarity: str,
-) -> None:
-    """Back-compat wrapper: routes to award_legacy()."""
-    await self.award_legacy(guild_id, user_id, character_name, amount, polarity)
-
-async def convert_points_to_stars(
-    self,
-    guild_id: int,
-    user_id: int,
-    character_name: str,
-    stars: int,
-    star_type: str,
-    spend_plus: int,
-    spend_minus: int,
-) -> None:
-    """Back-compat wrapper: routes to convert_star()."""
-    await self.convert_star(
-        guild_id=guild_id,
-        user_id=user_id,
-        character_name=character_name,
-        stars=stars,
-        star_type=star_type,
-        spend_plus=spend_plus,
-        spend_minus=spend_minus,
-    )
-
-
     async def reset_points(self, guild_id: int, user_id: int, name: str,
                            legacy_plus: Optional[int], legacy_minus: Optional[int],
                            lifetime_plus: Optional[int], lifetime_minus: Optional[int]) -> None:
@@ -1332,12 +1299,16 @@ class VilyraBotClient(discord.Client):
         """Lightweight startup audit to prevent 'orphaned' functions after edits."""
         required_db_methods = [
             "connect", "close", "init_schema",
+            "detect_schema",
             "add_character", "add_ability",
-            "award_legacy_points", "convert_points_to_stars",
+            "award_legacy", "convert_star", "spend_legacy",
             "upgrade_ability",
-            "list_characters", "list_abilities",
+            "list_characters", "list_abilities", "list_player_ids",
+            "get_player_rank", "set_player_rank",
+            "reset_points", "reset_stars",
             "get_dashboard_entry", "get_dashboard_message_ids",
             "set_dashboard_message_ids", "clear_dashboard_message_ids",
+            "get_latest_player_data_updated_at",
         ]
         missing = [m for m in required_db_methods if not hasattr(self.db, m)]
         if missing:
