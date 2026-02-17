@@ -528,6 +528,7 @@ class Database:
         else:
             raise ValueError("pool must be positive or negative")
 
+
 async def convert_star(
     self,
     guild_id: int,
@@ -540,13 +541,15 @@ async def convert_star(
 ) -> None:
     """
     Convert AVAILABLE legacy points into stars (stars are assigned, never consumed).
-    Costs:
-      - ability star: 10 total points (can split + and -)
-      - influence_positive star: 10 positive points each
-      - influence_negative star: 10 negative points each
+
+    Costs (per star):
+      - ability: 10 total points (can split positive/negative)
+      - influence_positive: 10 positive points only
+      - influence_negative: 10 negative points only
+
     Caps:
       - ability stars max 5
-      - total influence stars (pos+neg) max 5
+      - total influence stars (positive + negative) max 5
     """
     star_type = star_type.strip().lower()
     name = name.strip()
@@ -564,41 +567,39 @@ async def convert_star(
 
     total_cost = STAR_COST * stars
 
-    # Validate/cap target
+    # Validate/cap target and payment shape
     if star_type == "ability":
         if st["ability_stars"] + stars > MAX_ABILITY_STARS:
-            raise ValueError("Ability stars already at max (5).")
-        # ability stars can be purchased with ANY mix totaling 10 per star
+            raise ValueError("Ability stars cannot exceed 5.")
         if spend_plus + spend_minus != total_cost:
             raise ValueError(f"Ability stars cost {total_cost} total points. Provide spend_plus + spend_minus = {total_cost}.")
     elif star_type == "influence_positive":
         if infl_total + stars > MAX_INFL_STARS_TOTAL:
             raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
-        # positive influence stars must be paid with positive points only
         if spend_plus != total_cost or spend_minus != 0:
             raise ValueError(f"Positive influence stars cost {total_cost} POSITIVE points. Provide spend_plus={total_cost}, spend_minus=0.")
     elif star_type == "influence_negative":
         if infl_total + stars > MAX_INFL_STARS_TOTAL:
             raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
-        # negative influence stars must be paid with negative points only
         if spend_minus != total_cost or spend_plus != 0:
             raise ValueError(f"Negative influence stars cost {total_cost} NEGATIVE points. Provide spend_plus=0, spend_minus={total_cost}.")
     else:
         raise ValueError("star_type must be ability, influence_positive, or influence_negative")
 
-    # Validate available pools
+    # Ensure we have enough AVAILABLE points
     if spend_plus > st["legacy_plus"]:
         raise ValueError(f"Not enough available positive points (need {spend_plus}, have {st['legacy_plus']}).")
     if spend_minus > st["legacy_minus"]:
         raise ValueError(f"Not enough available negative points (need {spend_minus}, have {st['legacy_minus']}).")
 
-    # Spend ONLY from AVAILABLE pools
+    # Spend ONLY from AVAILABLE pools + bump updated_at
     await self._execute(
-        "UPDATE characters SET legacy_plus=legacy_plus-%s, legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+        "UPDATE characters SET legacy_plus=legacy_plus-%s, legacy_minus=legacy_minus-%s, updated_at=NOW() "
+        "WHERE guild_id=%s AND user_id=%s AND name=%s;",
         (spend_plus, spend_minus, guild_id, user_id, name),
     )
 
-    # Apply stars
+    # Apply stars + bump updated_at
     if star_type == "ability":
         await self._execute(
             "UPDATE characters SET ability_stars=ability_stars+%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
@@ -1213,8 +1214,6 @@ async def convert_star(
         await safe_reply(interaction, f"Convert failed: {e}")
 
 
-
-
 @app_commands.command(name="convert_points_to_stars", description="(Staff) Convert available legacy points into stars (10 points per star).")
 @in_guild_only()
 @staff_only()
@@ -1227,7 +1226,7 @@ async def convert_points_to_stars(
     spend_positive: int,
     spend_negative: int,
 ):
-    """Alias for /convert_star using the newer spend-split transaction logic."""
+    """Alias for /convert_star."""
     await convert_star(
         interaction=interaction,
         user=user,
@@ -1237,6 +1236,7 @@ async def convert_points_to_stars(
         spend_positive=spend_positive,
         spend_negative=spend_negative,
     )
+
 
 @app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character (use for corrections).")
 @in_guild_only()
