@@ -3,7 +3,7 @@ import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Literal
 
 import discord
 from discord import app_commands
@@ -533,7 +533,7 @@ class Database:
         guild_id: int,
         user_id: int,
         name: str,
-        star_type: str,
+        star_type: Literal['ability','influence_positive','influence_negative'],
         stars: int,
         spend_plus: int,
         spend_minus: int,
@@ -1169,13 +1169,18 @@ async def award_legacy_points(interaction: discord.Interaction, user: discord.Me
 
 
 @app_commands.command(name="convert_star", description="(Staff) Convert available legacy points into stars (10 points per star).")
+@app_commands.choices(star_type=[
+    app_commands.Choice(name="Ability Star", value="ability"),
+    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
+    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
+])
 @in_guild_only()
 @staff_only()
 async def convert_star(
     interaction: discord.Interaction,
     user: discord.Member,
     character_name: str,
-    star_type: str,
+    star_type: Literal['ability','influence_positive','influence_negative'],
     stars: int,
     spend_positive: int,
     spend_negative: int,
@@ -1212,13 +1217,18 @@ async def convert_star(
         await safe_reply(interaction, f"Convert failed: {e}")
 
 @app_commands.command(name="convert_points_to_stars", description="(Staff) Convert available legacy points into stars (10 points per star).")
+@app_commands.choices(star_type=[
+    app_commands.Choice(name="Ability Star", value="ability"),
+    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
+    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
+])
 @in_guild_only()
 @staff_only()
 async def convert_points_to_stars(
     interaction: discord.Interaction,
     user: discord.Member,
     character_name: str,
-    star_type: str,
+    star_type: Literal['ability','influence_positive','influence_negative'],
     stars: int,
     spend_positive: int,
     spend_negative: int,
