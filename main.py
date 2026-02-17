@@ -1462,6 +1462,8 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(character_add)
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
+        self.tree.add_command(convert_points_to_stars)
+        self.tree.add_command(staff_commands)
         self.tree.add_command(reset_points)
         self.tree.add_command(reset_stars)
         self.tree.add_command(add_ability)
