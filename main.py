@@ -838,6 +838,20 @@ class Database:
 
     # -------- Dashboard message tracking --------
 
+
+@dataclass
+class CharacterCard:
+    name: str
+    legacy_plus: int
+    legacy_minus: int
+    lifetime_plus: int
+    lifetime_minus: int
+    ability_stars: int
+    infl_plus: int
+    infl_minus: int
+    abilities: List[Tuple[str, int]]  # (ability_name, upgrades/level)
+
+
 async def build_character_card(db: Database, guild_id: int, user_id: int, name: str) -> CharacterCard:
     st = await db.get_character_state(guild_id, user_id, name)
     abilities = await db.list_abilities(guild_id, user_id, name)
@@ -1281,6 +1295,36 @@ class VilyraBotClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.db = db
         self.dashboard_limiter = SimpleRateLimiter(DASHBOARD_EDIT_MIN_INTERVAL)
+    def _selfcheck(self) -> None:
+        """Lightweight startup audit to prevent 'orphaned' functions after edits."""
+        required_db_methods = [
+            "connect", "close", "init_schema",
+            "add_character", "add_ability",
+            "award_legacy_points", "convert_points_to_stars",
+            "upgrade_ability",
+            "list_characters", "list_abilities",
+            "get_dashboard_entry", "get_dashboard_message_ids",
+            "set_dashboard_message_ids", "clear_dashboard_message_ids",
+        ]
+        missing = [m for m in required_db_methods if not hasattr(self.db, m)]
+        if missing:
+            LOG.error("SELF-CHECK FAILED: Database missing methods: %s", ", ".join(missing))
+        else:
+            LOG.info("Self-check: Database methods OK (%d checked).", len(required_db_methods))
+
+        required_commands = [
+            "set_server_rank", "add_character", "character_add", "award_legacy_points",
+            "convert_star", "reset_points", "reset_stars", "add_ability",
+            "upgrade_ability", "refresh_dashboard", "char_card",
+        ]
+        present = {c.name for c in self.tree.get_commands()}
+        missing_cmds = [c for c in required_commands if c not in present]
+        if missing_cmds:
+            LOG.error("SELF-CHECK FAILED: Command(s) not registered in tree: %s", ", ".join(missing_cmds))
+        else:
+            LOG.info("Self-check: Command tree OK (%d commands).", len(present))
+
+
 
     async def setup_hook(self) -> None:
         # Register commands
@@ -1297,6 +1341,8 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(char_card)
 
         LOG.info("Command tree prepared: %s command(s); GUILD_ID=%s", len(self.tree.get_commands()), os.getenv("GUILD_ID"))
+
+        self._selfcheck()
 
         # Sync commands
         try:
@@ -1332,6 +1378,7 @@ class VilyraBotClient(discord.Client):
 
     async def on_ready(self) -> None:
         LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
+        LOG.info("Startup dashboard refresh: beginning for %d guild(s)...", len(list(self.guilds)))
         for g in list(self.guilds):
             try:
                 status = await refresh_all_dashboards(self, g)
