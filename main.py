@@ -36,6 +36,8 @@ DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "1.
 PLAYER_POST_SOFT_LIMIT = 1900
 
 SERVER_RANKS = [
+    "Guardian",
+    "Warden",
     "Newcomer",
     "Apprentice",
     "Adventurer",
@@ -437,6 +439,18 @@ class Database:
             (guild_id, user_id),
         )
 
+    async def set_character_archived(self, guild_id: int, user_id: int, character_name: str, archived: bool) -> bool:
+        """Archive/unarchive a character. Returns True if a row was updated."""
+        sql = """
+            UPDATE characters
+               SET archived=%s,
+                   updated_at=NOW()
+             WHERE guild_id=%s
+               AND user_id=%s
+               AND name=%s;
+        """
+        rowcount = await self._execute(sql, (archived, guild_id, user_id, character_name))
+        return bool(rowcount and rowcount > 0)
     async def character_exists(self, guild_id: int, user_id: int, name: str) -> bool:
         row = await self._fetchone(
             "SELECT 1 FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s AND COALESCE(archived, FALSE)=FALSE LIMIT 1;",
@@ -878,10 +892,11 @@ class Database:
             """
             SELECT GREATEST(
                 COALESCE((SELECT MAX(updated_at) FROM characters WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
-                COALESCE((SELECT MAX(updated_at) FROM abilities WHERE guild_id=%s AND user_id=%s), to_timestamp(0))
+                COALESCE((SELECT MAX(updated_at) FROM abilities WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
+                COALESCE((SELECT MAX(updated_at) FROM players WHERE guild_id=%s AND user_id=%s), to_timestamp(0))
             ) AS ts
             """,
-            (guild_id, user_id, guild_id, user_id),
+            (guild_id, user_id, guild_id, user_id, guild_id, user_id),
         )
         return row["ts"] if row else None
 
@@ -1142,6 +1157,44 @@ async def add_character(interaction: discord.Interaction, user: discord.Member, 
 @staff_only()
 async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str):
     await add_character(interaction, user, character_name)
+
+
+@app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character (hide/show on dashboard).")
+@app_commands.guild_only()
+@staff_only()
+@app_commands.describe(user="Player who owns the character", character_name="Character to archive/unarchive")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Archive", value="archive"),
+    app_commands.Choice(name="Unarchive", value="unarchive"),
+])
+async def character_archive(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    action: app_commands.Choice[str],
+):
+    """Archive/unarchive a character. Archived characters are hidden from dashboard + cards."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    do_archive = (action.value == "archive")
+
+    ok = await run_db(
+        interaction.client.db.set_character_archived(interaction.guild.id, user.id, character_name, do_archive),
+        "set_character_archived",
+    )
+    if not ok:
+        await interaction.followup.send(f"Character not found: **{character_name}**", ephemeral=True)
+        return
+
+    status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+    # Command log
+    verb = "archived" if do_archive else "unarchived"
+    await log_to_channel(
+        interaction.client,
+        COMMAND_LOG_CHANNEL_ID,
+        f"🗄 {interaction.user.mention} {verb} **{character_name}** for {user.mention}",
+    )
+
+    await interaction.followup.send(f"✅ {verb.title()} **{character_name}**. {status}", ephemeral=True)
 
 
 @app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
@@ -1447,6 +1500,7 @@ class VilyraBotClient(discord.Client):
             "get_dashboard_entry", "get_dashboard_message_ids",
             "set_dashboard_message_ids", "clear_dashboard_message_ids",
             "get_latest_player_data_updated_at",
+            "set_character_archived",
         ]
         missing = [m for m in required_db_methods if not hasattr(self.db, m)]
         if missing:
@@ -1460,6 +1514,7 @@ class VilyraBotClient(discord.Client):
             "upgrade_ability", "refresh_dashboard", "char_card",
             "convert_points_to_stars",
             "staff_commands",
+            "character_archive",
         ]
         present = {c.name for c in self.tree.get_commands()}
         missing_cmds = [c for c in required_commands if c not in present]
@@ -1475,6 +1530,7 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(set_server_rank)
         self.tree.add_command(add_character)
         self.tree.add_command(character_add)
+        self.tree.add_command(character_archive)
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
         self.tree.add_command(convert_points_to_stars)
