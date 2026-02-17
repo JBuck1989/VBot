@@ -1168,28 +1168,22 @@ async def award_legacy_points(interaction: discord.Interaction, user: discord.Me
         await safe_reply(interaction, f"Award failed: {e}")
 
 
-@app_commands.command(name="convert_star", description="(Staff) Convert available legacy points into stars (10 points per star).")
-@app_commands.choices(star_type=[
-    app_commands.Choice(name="Ability Star", value="ability"),
-    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
-    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
-])
-@in_guild_only()
-@staff_only()
-async def convert_star(
+
+async def _handle_convert_star_interaction(
     interaction: discord.Interaction,
     user: discord.Member,
     character_name: str,
-    star_type: Literal['ability','influence_positive','influence_negative'],
+    star_type: str,
     stars: int,
     spend_positive: int,
     spend_negative: int,
-):
+) -> None:
+    """Shared implementation for /convert_star and /convert_points_to_stars."""
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
         character_name = character_name.strip()
-        star_type = star_type.strip().lower()
+        star_type = str(star_type).strip().lower()
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
 
@@ -1216,6 +1210,26 @@ async def convert_star(
         LOG.exception("convert_star failed")
         await safe_reply(interaction, f"Convert failed: {e}")
 
+
+@app_commands.command(name="convert_star", description="(Staff) Convert available legacy points into stars (10 points per star).")
+@app_commands.choices(star_type=[
+    app_commands.Choice(name="Ability Star", value="ability"),
+    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
+    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
+])
+@in_guild_only()
+@staff_only()
+async def convert_star(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    star_type: Literal['ability','influence_positive','influence_negative'],
+    stars: int,
+    spend_positive: int,
+    spend_negative: int,
+):
+    await _handle_convert_star_interaction(interaction, user, character_name, star_type, stars, spend_positive, spend_negative)
+
 @app_commands.command(name="convert_points_to_stars", description="(Staff) Convert available legacy points into stars (10 points per star).")
 @app_commands.choices(star_type=[
     app_commands.Choice(name="Ability Star", value="ability"),
@@ -1233,16 +1247,7 @@ async def convert_points_to_stars(
     spend_positive: int,
     spend_negative: int,
 ):
-    """Alias for /convert_star (preferred name)."""
-    await convert_star(
-        interaction=interaction,
-        user=user,
-        character_name=character_name,
-        star_type=star_type,
-        stars=stars,
-        spend_positive=spend_positive,
-        spend_negative=spend_negative,
-    )
+    await _handle_convert_star_interaction(interaction, user, character_name, star_type, stars, spend_positive, spend_negative)
 
 @app_commands.command(name="staff_commands", description="(Staff) Show a quick list of staff commands and what they do.")
 @in_guild_only()
