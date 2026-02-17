@@ -564,6 +564,39 @@ class Database:
         else:
             raise ValueError("star_type must be ability, influence_positive, or influence_negative")
 
+async def award_legacy_points(
+    self,
+    guild_id: int,
+    user_id: int,
+    character_name: str,
+    amount: int,
+    polarity: str,
+) -> None:
+    """Back-compat wrapper: routes to award_legacy()."""
+    await self.award_legacy(guild_id, user_id, character_name, amount, polarity)
+
+async def convert_points_to_stars(
+    self,
+    guild_id: int,
+    user_id: int,
+    character_name: str,
+    stars: int,
+    star_type: str,
+    spend_plus: int,
+    spend_minus: int,
+) -> None:
+    """Back-compat wrapper: routes to convert_star()."""
+    await self.convert_star(
+        guild_id=guild_id,
+        user_id=user_id,
+        character_name=character_name,
+        stars=stars,
+        star_type=star_type,
+        spend_plus=spend_plus,
+        spend_minus=spend_minus,
+    )
+
+
     async def reset_points(self, guild_id: int, user_id: int, name: str,
                            legacy_plus: Optional[int], legacy_minus: Optional[int],
                            lifetime_plus: Optional[int], lifetime_minus: Optional[int]) -> None:
