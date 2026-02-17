@@ -1213,6 +1213,31 @@ async def convert_star(
         await safe_reply(interaction, f"Convert failed: {e}")
 
 
+
+
+@app_commands.command(name="convert_points_to_stars", description="(Staff) Convert available legacy points into stars (10 points per star).")
+@in_guild_only()
+@staff_only()
+async def convert_points_to_stars(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    star_type: str,
+    stars: int,
+    spend_positive: int,
+    spend_negative: int,
+):
+    """Alias for /convert_star using the newer spend-split transaction logic."""
+    await convert_star(
+        interaction=interaction,
+        user=user,
+        character_name=character_name,
+        star_type=star_type,
+        stars=stars,
+        spend_positive=spend_positive,
+        spend_negative=spend_negative,
+    )
+
 @app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character (use for corrections).")
 @in_guild_only()
 @staff_only()
@@ -1397,6 +1422,7 @@ class VilyraBotClient(discord.Client):
             "set_server_rank", "add_character", "character_add", "award_legacy_points",
             "convert_star", "reset_points", "reset_stars", "add_ability",
             "upgrade_ability", "refresh_dashboard", "char_card",
+            "convert_points_to_stars",
         ]
         present = {c.name for c in self.tree.get_commands()}
         missing_cmds = [c for c in required_commands if c not in present]
