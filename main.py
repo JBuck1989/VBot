@@ -1526,7 +1526,9 @@ async def char_card(interaction: discord.Interaction, character_name: str, user:
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, target.id, character_name), "require_character")
         card = await run_db(build_character_card(interaction.client.db, interaction.guild.id, target.id, character_name), "build_character_card")
-        await safe_reply(interaction, render_character_block(card))
+        embed = discord.Embed()
+        embed.set_image(url='https://media.discordapp.net/attachments/1324994929176612936/1473872568191553568/1631280-doc_brown_full.jpg?ex=6997ca4b&is=699678cb&hm=fdc25510e3a9575ccf7f1cad504c577ac1d2a6b494e2810b0425c3b9211c8e7b&=&format=webp&width=869&height=856')
+        await safe_reply(interaction, render_character_block(card), embed=embed)
     except Exception as e:
         LOG.exception("char_card failed")
         await safe_reply(interaction, f"Lookup failed: {e}")
