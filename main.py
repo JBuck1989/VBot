@@ -1,1110 +1,1679 @@
 import os
-import json
 import asyncio
-import datetime as dt
+import hashlib
+import logging
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Literal
 
 import discord
 from discord import app_commands
 
-import asyncpg
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # type: ignore
+import psycopg
+from psycopg.rows import dict_row
 
 
-# -------------------------
-# Version / Config
-# -------------------------
-VERSION = "EconBot_v30"
+# -----------------------------
+# Config
+# -----------------------------
 
-TZ_NAME = "America/Chicago"
-TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
+DEFAULT_DASHBOARD_CHANNEL_ID = 1469879866655768738
+DEFAULT_COMMAND_LOG_CHANNEL_ID = 1469879960729817098
 
-BASE_DAILY_INCOME_VAL = 10  # 10 Cinths == 10 Val == 1 Arce
+GUARDIAN_ROLE_NAME = "Guardian"
+WARDEN_ROLE_NAME = "Warden"
 
-# Denominations (in Val)
-DENOMS: List[Tuple[str, int]] = [
-    ("NOVIR", 10_000),
-    ("ORIN", 1_000),
-    ("ELSH", 100),
-    ("ARCE", 10),
-    ("CINTH", 1),
+MAX_ABILITY_STARS = 5
+MAX_INFL_STARS_TOTAL = 5
+
+STAR_COST = 10
+MINOR_UPGRADE_COST = 5
+
+REP_MIN = -100
+REP_MAX = 100
+
+
+DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "1.2"))
+PLAYER_POST_SOFT_LIMIT = 1900
+
+SERVER_RANKS = [
+    "Guardian",
+    "Warden",
+    "Newcomer",
+    "Apprentice",
+    "Adventurer",
+    "Sentinel",
+    "Champion",
+    "Legend",
+    "Sovereign",
 ]
 
+BORDER_LEN = 20
+PLAYER_BORDER = "═" * BORDER_LEN
+CHAR_SEPARATOR = "-" * BORDER_LEN
+CHAR_HEADER_LEFT = "꧁•⊹٭ "
+CHAR_HEADER_RIGHT = " ٭⊹•꧂"
 
-def _get(name: str, default: str | None = None) -> str | None:
+
+LOG = logging.getLogger("VilyraBot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] VilyraBot: %(message)s")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def env(name: str) -> str:
     v = os.getenv(name)
-    if v is None:
-        return default
-    v = str(v).strip()
-    return v if v else default
-
-
-def _req_token() -> str:
-    v = _get("DISCORD_TOKEN")
     if not v:
-        raise RuntimeError("Missing required env var: DISCORD_TOKEN")
+        raise RuntimeError(f"Missing required environment variable: {name}")
     return v
 
 
-def _parse_int(v: str | None) -> int | None:
+def safe_int(v: Any, default: int = 0) -> int:
     try:
-        return int(v) if v is not None and str(v).strip() != "" else None
+        if v is None:
+            return default
+        return int(v)
     except Exception:
-        return None
+        return default
 
 
-def _parse_int_list(v: str | None) -> list[int]:
-    if not v:
-        return []
-    out: list[int] = []
-    for part in v.split(","):
-        part = part.strip()
-        if part.isdigit():
-            out.append(int(part))
-    return out
+def clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
 
 
-def _parse_int_set(v: str | None) -> set[int]:
-    return set(_parse_int_list(v))
+def db_timeout() -> int:
+    return max(3, safe_int(os.getenv("DB_TIMEOUT_SECONDS"), 12))
 
 
-DISCORD_TOKEN = _req_token()
-DATABASE_URL = _get("DATABASE_URL")
-
-GUILD_ID = _parse_int(_get("GUILD_ID"))
-LEGACY_SOURCE_GUILD_ID = _parse_int(_get("LEGACY_SOURCE_GUILD_ID")) or GUILD_ID
-
-BANK_CHANNEL_ID = _parse_int(_get("BANK_CHANNEL_ID"))
-ECON_LOG_CHANNEL_ID = _parse_int(_get("ECON_LOG_CHANNEL_ID"))
-
-BANK_MESSAGE_IDS = _parse_int_list(_get("BANK_MESSAGE_IDS"))
-
-STAFF_ROLE_IDS = _parse_int_set(
-    _get("STAFF_ROLE_IDS")
-    or _get("Staff_Role_IDs")
-    or _get("STAFF_ROLE_IDs")
-    or _get("STAFF_ROLE_IDS")
-)
+def is_staff(member: discord.abc.User | discord.Member) -> bool:
+    roles = getattr(member, "roles", None) or []
+    for r in roles:
+        if getattr(r, "name", "") in (GUARDIAN_ROLE_NAME, WARDEN_ROLE_NAME):
+            return True
+    return False
 
 
-# -------------------------
-# Asset Catalog (from uploaded Asset Table.xlsx)
-# Keys: (asset_type, secondary_type, tier_name)
-# Costs are absolute (exact to spreadsheet) in Val.
-# -------------------------
-ASSET_CATALOG: List[Dict[str, object]] = [
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 1, "tier_name": 'Apprentice', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 2, "tier_name": 'Journeyman', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 3, "tier_name": 'Leased Workshop', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 4, "tier_name": 'Small Workshop', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 5, "tier_name": 'Large Workshop', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 1, "tier_name": 'Consignment Arrangement', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 2, "tier_name": 'Small Alley Stand', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 3, "tier_name": 'Market Stall', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 4, "tier_name": 'Small Shop', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 5, "tier_name": 'Large Shop', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 1, "tier_name": 'Subsistence Surplus', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 2, "tier_name": 'Leased Fields', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 3, "tier_name": 'Owned Acre', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 4, "tier_name": 'Small Fields and Barn', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 5, "tier_name": 'Large Fields and Barn', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 1, "tier_name": 'One-Room Flophouse', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 2, "tier_name": 'Leased Establishment', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 3, "tier_name": 'Small Tavern', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 4, "tier_name": 'Large Tavern', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 5, "tier_name": 'Large Tavern and Inn', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 1, "tier_name": 'Small Storage Shed', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 2, "tier_name": 'Large Storage Shed', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 3, "tier_name": 'Small Trading Post', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 4, "tier_name": 'Large Trading Post', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 5, "tier_name": 'Large Warehouse and Trading Post', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 1, "tier_name": 'Shack', "cost_val": 600, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 2, "tier_name": 'Hut', "cost_val": 1200, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 3, "tier_name": 'House', "cost_val": 2000, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 4, "tier_name": 'Lodge', "cost_val": 3000, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 5, "tier_name": 'Mansion', "cost_val": 5000, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 1, "tier_name": 'Chartered Assembly', "cost_val": 1200, "income_val": 100},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 2, "tier_name": 'Hamlet', "cost_val": 2400, "income_val": 200},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 3, "tier_name": 'Village', "cost_val": 4800, "income_val": 300},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 4, "tier_name": 'Town', "cost_val": 9600, "income_val": 400},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 5, "tier_name": 'Small City', "cost_val": 15000, "income_val": 500},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 1, "tier_name": 'Hit +1 / Dmg +1d4', "cost_val": 300, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 2, "tier_name": 'Hit +1 / Dmg +1d6', "cost_val": 600, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 3, "tier_name": 'Hit +2 / Dmg +1d8', "cost_val": 1200, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 4, "tier_name": 'Hit +2 / Dmg +1d10', "cost_val": 2400, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 5, "tier_name": 'Hit +2 / Dmg +1d12', "cost_val": 4800, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 1, "tier_name": 'AC +1', "cost_val": 300, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 2, "tier_name": 'AC +2', "cost_val": 600, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 3, "tier_name": 'AC +2 / Adv Magic Atk', "cost_val": 1200, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 4, "tier_name": 'AC +2 / Adv Magic and Melee Atk', "cost_val": 2400, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 5, "tier_name": 'AC +3 / Adv Magic and Melee Atk', "cost_val": 4800, "income_val": 0},
-]
-
-
-def _catalog_key(a: Dict[str, object]) -> Tuple[str, str, str]:
-    return (str(a["asset_type"]), str(a["secondary_type"]), str(a["tier_name"]))
-
-
-CATALOG_BY_KEY: Dict[Tuple[str, str, str], Dict[str, object]] = { _catalog_key(a): a for a in ASSET_CATALOG }
-
-
-# -------------------------
-# DB
-# -------------------------
-_pool: asyncpg.Pool | None = None
-
-
-async def db_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set; database features are disabled.")
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    return _pool
-
-
-async def init_db() -> None:
-    if not DATABASE_URL:
-        print(f"[{VERSION}] DATABASE_URL missing; running without DB.")
-        return
-
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        await con.execute("CREATE SCHEMA IF NOT EXISTS economy")
-
-        # Balances (stored in Val)
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.balances (
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                balance_val BIGINT NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, character_name)
-            )
-            """
-        )
-
-        # Income claims (daily, per character)
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.income_claims (
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                claim_date DATE NOT NULL,
-                claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, character_name, claim_date)
-            )
-            """
-        )
-
-        # Owned assets (named by player; upgrades replace tier fields but keep asset_name)
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.assets_owned (
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                character_user_id BIGINT NOT NULL,
-                asset_name TEXT NOT NULL,
-                asset_type TEXT NOT NULL,
-                secondary_type TEXT NOT NULL,
-                tier_name TEXT NOT NULL,
-                tier INTEGER NOT NULL,
-                cost_val BIGINT NOT NULL,
-                income_val BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, character_name, character_user_id, asset_name)
-            )
-            """
-        )
-
-        # Action log
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.ledger (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                character_user_id BIGINT NOT NULL,
-                actor_user_id BIGINT NOT NULL,
-                kind TEXT NOT NULL,
-                delta_val BIGINT NOT NULL,
-                reason TEXT NOT NULL,
-                details_json TEXT NOT NULL
-            )
-            """
-        )
-
-
-# -------------------------
-# Legacy characters table helpers
-# -------------------------
-@dataclass
-class Character:
-    guild_id: int
-    user_id: int
-    name: str
-    archived: bool
-
-
-async def fetch_character_by_name(legacy_guild_id: int, name: str) -> Character | None:
-    """Legacy source: public.characters. Character ID is name (unique per guild)."""
-    if not DATABASE_URL:
-        return None
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
-            SELECT guild_id, user_id, name, archived
-            FROM characters
-            WHERE guild_id=$1 AND name=$2
-            LIMIT 1
-            """,
-            int(legacy_guild_id),
-            str(name),
-        )
-        if not row:
-            return None
-        return Character(
-            guild_id=int(row["guild_id"]),
-            user_id=int(row["user_id"]),
-            name=str(row["name"]),
-            archived=bool(row["archived"]),
-        )
-
-
-async def search_characters(legacy_guild_id: int, query: str, limit: int = 25) -> List[str]:
-    if not DATABASE_URL:
-        return []
-    q = (query or "").strip()
-    if not q:
-        q = ""
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            SELECT name
-            FROM characters
-            WHERE guild_id=$1
-              AND archived=FALSE
-              AND name ILIKE $2
-            ORDER BY name ASC
-            LIMIT $3
-            """,
-            int(legacy_guild_id),
-            f"%{q}%",
-            int(limit),
-        )
-        return [str(r["name"]) for r in rows]
-
-
-# -------------------------
-# Economy helpers
-# -------------------------
-async def get_balance_val(guild_id: int, character_name: str) -> int:
-    if not DATABASE_URL:
-        return 0
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2",
-            int(guild_id),
-            str(character_name),
-        )
-        return int(row["balance_val"]) if row else 0
-
-
-async def set_balance_val(guild_id: int, character_name: str, new_val: int) -> None:
-    if not DATABASE_URL:
-        return
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            INSERT INTO economy.balances (guild_id, character_name, balance_val, updated_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (guild_id, character_name)
-            DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
-            """,
-            int(guild_id),
-            str(character_name),
-            int(new_val),
-        )
-
-
-async def add_balance_val(guild_id: int, character_name: str, delta: int) -> int:
-    """Adds delta, never below 0. Returns updated balance."""
-    if not DATABASE_URL:
-        return 0
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        async with con.transaction():
-            cur = await con.fetchrow(
-                "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2 FOR UPDATE",
-                int(guild_id),
-                str(character_name),
-            )
-            cur_val = int(cur["balance_val"]) if cur else 0
-            new_val = cur_val + int(delta)
-            if new_val < 0:
-                new_val = 0
-            await con.execute(
-                """
-                INSERT INTO economy.balances (guild_id, character_name, balance_val, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (guild_id, character_name)
-                DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
-                """,
-                int(guild_id),
-                str(character_name),
-                int(new_val),
-            )
-            return int(new_val)
-
-
-async def sum_asset_income_val(guild_id: int, character_name: str) -> int:
-    if not DATABASE_URL:
-        return 0
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
-            SELECT COALESCE(SUM(income_val), 0) AS s
-            FROM economy.assets_owned
-            WHERE guild_id=$1 AND character_name=$2
-            """,
-            int(guild_id),
-            str(character_name),
-        )
-        return int(row["s"]) if row else 0
-
-
-async def fetch_assets_owned(guild_id: int, character_name: str) -> List[Dict[str, object]]:
-    if not DATABASE_URL:
-        return []
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            SELECT asset_name, asset_type, secondary_type, tier_name, tier, cost_val, income_val, character_user_id
-            FROM economy.assets_owned
-            WHERE guild_id=$1 AND character_name=$2
-            ORDER BY asset_type, secondary_type, tier DESC, asset_name
-            """,
-            int(guild_id),
-            str(character_name),
-        )
-        return [dict(r) for r in rows]
-
-
-async def ledger_write(
-    guild_id: int,
-    character_name: str,
-    character_user_id: int,
-    actor_user_id: int,
-    kind: str,
-    delta_val: int,
-    reason: str,
-    details: Dict[str, object] | None = None,
-) -> None:
-    if not DATABASE_URL:
-        return
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            INSERT INTO economy.ledger (guild_id, character_name, character_user_id, actor_user_id, kind, delta_val, reason, details_json)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            """,
-            int(guild_id),
-            str(character_name),
-            int(character_user_id),
-            int(actor_user_id),
-            str(kind),
-            int(delta_val),
-            str(reason),
-            json.dumps(details or {}, ensure_ascii=False),
-        )
-
-
-# -------------------------
-# Formatting
-# -------------------------
-UNIT_LABELS = {
-    "CINTH": "Cinth",
-    "ARCE": "Arce",
-    "ELSH": "Elsh",
-    "ORIN": "Orin",
-    "NOVIR": "Novir",
-}
-
-
-def breakdown_denoms(val: int) -> List[Tuple[str, int]]:
-    remaining = int(max(0, val))
-    parts: List[Tuple[str, int]] = []
-    for unit, unit_val in DENOMS:
-        if remaining <= 0:
-            break
-        count = remaining // unit_val
-        if count:
-            parts.append((unit, int(count)))
-            remaining -= count * unit_val
-    if not parts:
-        parts = [("CINTH", 0)]
-    return parts
-
-
-def format_money(val: int) -> str:
-    parts = breakdown_denoms(val)
-    out = []
-    for unit, count in parts:
-        label = UNIT_LABELS.get(unit, unit.title())
-        plural = "" if count == 1 else "s"
-        out.append(f"{count} {label}{plural}")
-    return ", ".join(out)
-
-
-def format_assets_lines(assets: List[Dict[str, object]]) -> str:
-    if not assets:
-        return "*(None)*"
-    lines = []
-    for a in assets:
-        asset_name = str(a.get("asset_name", "")).strip()
-        tier_name = str(a.get("tier_name", "")).strip()
-        lines.append(f"{asset_name} — {tier_name}")
-    return "\n".join(lines)
-
-
-# -------------------------
-# Discord setup
-# -------------------------
-intents = discord.Intents.none()
-intents.guilds = True
-
-client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
-tree = app_commands.CommandTree(client)
-
-
-@tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    msg: str
-    if isinstance(error, app_commands.CheckFailure):
-        msg = str(error) or "You don’t have permission to use that command."
-    elif isinstance(error, app_commands.CommandInvokeError) and getattr(error, "original", None) is not None:
-        orig = error.original
-        msg = f"Command error: {type(orig).__name__}: {orig}"
-    else:
-        msg = f"Command error: {type(error).__name__}: {error}"
-
+async def defer_ephemeral(interaction: discord.Interaction) -> None:
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        else:
-            await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
         pass
 
 
-def require_admin():
-    """Staff check using STAFF_ROLE_IDS; if not configured, fall back to admin perms."""
+async def safe_reply(interaction: discord.Interaction, content: str, *, embed: discord.Embed | None = None) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True, embed=embed)
+        else:
+            await interaction.response.send_message(content, ephemeral=True, embed=embed)
+    except Exception:
+        LOG.exception("Failed to send response/followup")
 
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            raise app_commands.CheckFailure("This command can only be used in a server.")
 
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member is None:
-            member = interaction.guild.get_member(interaction.user.id)
+async def run_db(coro, label: str):
+    try:
+        return await asyncio.wait_for(coro, timeout=db_timeout())
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"Database operation timed out ({label}).") from e
 
-        if member is None:
-            raise app_commands.CheckFailure("I couldn't verify your roles/permissions. Try again in a moment.")
 
-        if STAFF_ROLE_IDS:
-            if any(r.id in STAFF_ROLE_IDS for r in getattr(member, "roles", [])):
-                return True
-            raise app_commands.CheckFailure("You don’t have permission to use that command.")
+def fmt_ids(ids: List[int]) -> str:
+    return ",".join(str(i) for i in ids)
 
-        perms = getattr(member, "guild_permissions", None)
-        if perms and (perms.administrator or perms.manage_guild):
-            return True
 
-        raise app_commands.CheckFailure(
-            "Staff roles are not configured (STAFF_ROLE_IDS). Ask an admin to set STAFF_ROLE_IDS in Railway Variables."
+def parse_ids(s: Optional[str]) -> List[int]:
+    if not s:
+        return []
+    out: List[int] = []
+    for part in str(s).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except Exception:
+            continue
+    return out
+
+
+async def log_to_channel(guild: Optional[discord.Guild], text: str) -> None:
+    if not guild:
+        return
+    ch_id = safe_int(os.getenv("COMMAND_LOG_CHANNEL_ID"), DEFAULT_COMMAND_LOG_CHANNEL_ID)
+    try:
+        ch = guild.get_channel(ch_id) or await guild.fetch_channel(ch_id)
+        if isinstance(ch, discord.TextChannel):
+            await ch.send(text, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        LOG.exception("Failed to write to command log channel")
+
+class SimpleRateLimiter:
+    """Serialize dashboard message edits/creates to reduce 429s.
+    discord.py will still handle rate limits, but this prevents burst PATCH spam at startup."""
+    def __init__(self, min_interval: float = 1.0):
+        self.min_interval = max(0.0, float(min_interval))
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+
+    async def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            wait_for = (self._last + self.min_interval) - now
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            self._last = asyncio.get_running_loop().time()
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+# -----------------------------
+# UI Renderers
+# -----------------------------
+
+def render_ability_star_bar(n: int) -> str:
+    n = clamp(int(n), 0, MAX_ABILITY_STARS)
+    return "★" * n + "☆" * (MAX_ABILITY_STARS - n)
+
+
+def render_influence_star_bar(neg: int, pos: int) -> str:
+    neg = clamp(int(neg), 0, MAX_INFL_STARS_TOTAL)
+    pos = clamp(int(pos), 0, MAX_INFL_STARS_TOTAL)
+
+    neg_slots = ["☆"] * MAX_INFL_STARS_TOTAL
+    for i in range(neg):
+        neg_slots[MAX_INFL_STARS_TOTAL - 1 - i] = "★"
+
+    pos_slots = ["☆"] * MAX_INFL_STARS_TOTAL
+    for i in range(pos):
+        pos_slots[i] = "★"
+
+    return "- " + "".join(neg_slots) + " | " + "".join(pos_slots) + " +"
+
+
+def render_reputation_block(net_lifetime: int) -> str:
+    # 20/20 line with distinct center marker ┃ and ▲ indicator integrated in-line.
+    # IMPORTANT: The explainer is now end-aligned (no centerline), so it won't "shift" visually between desktop/mobile.
+    net = clamp(int(net_lifetime), REP_MIN, REP_MAX)
+
+    left_len = 20
+    right_len = 20
+    total = left_len + right_len
+
+    # Map REP_MIN..REP_MAX onto 0..total (inclusive). net=0 should land exactly at center (left_len).
+    pos = int(round((net - REP_MIN) / (REP_MAX - REP_MIN) * total))
+    pos = clamp(pos, 0, total)
+
+    bar = ["-"] * (total + 1)
+    center_idx = left_len
+    bar[center_idx] = "┃"
+    bar[pos] = "▲"
+
+    bar_line = "[" + "".join(bar) + "]"
+
+    left_text = "MALEVOLENT ←"
+    right_text = "→ BENEVOLENT"
+
+    # End-align the explainer to the same visual width as the bar line.
+    spaces = max(1, len(bar_line) - len(left_text) - len(right_text))
+    explainer = left_text + (" " * spaces) + right_text
+
+    return explainer + "\n" + bar_line
+
+
+
+# -----------------------------
+# Database Layer (schema autodetect)
+# -----------------------------
+
+class Database:
+    def __init__(self, dsn: str):
+        self._dsn = dsn
+        self._conn: Optional[psycopg.AsyncConnection] = None
+
+        # Detected columns
+        self.characters_cols: set[str] = set()
+        self.abilities_cols: set[str] = set()
+
+        # Detected "level" column in abilities (upgrade_level vs level)
+        self.abilities_level_col: str = "upgrade_level"
+        # Detected "character name" column in abilities (character_name vs name)
+        self.abilities_char_col: str = "character_name"
+
+    async def connect(self) -> None:
+        LOG.info("Connecting to PostgreSQL...")
+        self._conn = await psycopg.AsyncConnection.connect(self._dsn, autocommit=True, row_factory=dict_row)
+        LOG.info("PostgreSQL async connection established (autocommit=True)")
+
+    async def close(self) -> None:
+        if self._conn:
+            await self._conn.close()
+            self._conn = None
+
+    def _require_conn(self) -> psycopg.AsyncConnection:
+        if not self._conn:
+            raise RuntimeError("Database not connected")
+        return self._conn
+
+    async def _execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        conn = self._require_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+
+    async def _fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
+        conn = self._require_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            return await cur.fetchone()
+
+    async def _fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
+        conn = self._require_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(sql, params)
+            rows = await cur.fetchall()
+            return list(rows or [])
+
+    async def _load_table_columns(self, table: str) -> set[str]:
+        rows = await self._fetchall(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s;
+            """,
+            (table,),
+        )
+        return {str(r["column_name"]) for r in rows if r and r.get("column_name")}
+
+    async def detect_schema(self) -> None:
+        self.characters_cols = await self._load_table_columns("characters")
+        self.abilities_cols = await self._load_table_columns("abilities")
+
+        LOG.info("Detected characters columns: %s", ", ".join(sorted(self.characters_cols)) if self.characters_cols else "(none)")
+        LOG.info("Detected abilities columns: %s", ", ".join(sorted(self.abilities_cols)) if self.abilities_cols else "(none)")
+
+        # Abilities: level column
+        if "upgrade_level" in self.abilities_cols:
+            self.abilities_level_col = "upgrade_level"
+        elif "level" in self.abilities_cols:
+            self.abilities_level_col = "level"
+        else:
+            self.abilities_level_col = "upgrade_level"  # will be added
+
+        # Abilities: character column
+        if "character_name" in self.abilities_cols:
+            self.abilities_char_col = "character_name"
+        elif "name" in self.abilities_cols:
+            self.abilities_char_col = "name"
+        else:
+            self.abilities_char_col = "character_name"  # will be added
+
+        LOG.info("Schema choices: abilities.%s as level, abilities.%s as character key",
+                 self.abilities_level_col, self.abilities_char_col)
+
+    async def init_schema(self) -> None:
+        # Characters table exists already in your DB. We never drop it.
+        # Add the columns our bot needs, in case they were missing.
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS ability_stars INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_minus INT NOT NULL DEFAULT 0;")
+
+        # Ensure these exist too (your DB already has most of them, but safe):
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_plus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_minus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS lifetime_plus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS lifetime_minus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_plus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+
+        # Unique index (needed for ON CONFLICT)
+        try:
+            await self._execute("CREATE UNIQUE INDEX IF NOT EXISTS characters_unique ON characters (guild_id, user_id, name);")
+        except Exception:
+            LOG.exception("Could not create unique index on characters; continuing")
+
+        # Players table (server rank)
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS players (
+                guild_id      BIGINT NOT NULL,
+                user_id       BIGINT NOT NULL,
+                server_rank   TEXT   NOT NULL DEFAULT 'Newcomer',
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id)
+            );
+            """
         )
 
+        # Abilities table — create if missing
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS abilities (
+                guild_id       BIGINT NOT NULL,
+                user_id        BIGINT NOT NULL,
+                character_name TEXT NOT NULL,
+                ability_name   TEXT NOT NULL,
+                upgrade_level  INT  NOT NULL DEFAULT 0,
+                level          INT  NULL,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        # Add missing columns to existing abilities table
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS character_name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS ability_name TEXT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS upgrade_level INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS level INT;")
+        await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+
+        # If we have an older table that used (guild_id,user_id,name,ability_name) as keys,
+        # we can't safely add a PRIMARY KEY without knowing duplicates; so we do not force it.
+        # We *do* add an index that helps our lookups:
+        try:
+            await self._execute("CREATE INDEX IF NOT EXISTS abilities_lookup ON abilities (guild_id, user_id, character_name, ability_name);")
+        except Exception:
+            LOG.exception("Could not create abilities index; continuing")
+
+        # Dashboard tracking
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_messages (
+                guild_id      BIGINT NOT NULL,
+                user_id       BIGINT NOT NULL,
+                channel_id    BIGINT NOT NULL,
+                message_ids   TEXT,
+                content_hash  TEXT,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id)
+            );
+            """
+        )
+        await self._execute("ALTER TABLE dashboard_messages ADD COLUMN IF NOT EXISTS content_hash TEXT;")
+        await self.detect_schema()
+        LOG.info("Database schema initialized / updated")
+
+    # -------- Players --------
+
+    async def get_player_rank(self, guild_id: int, user_id: int) -> str:
+        row = await self._fetchone("SELECT server_rank FROM players WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
+        return str(row["server_rank"]) if row and row.get("server_rank") else "Newcomer"
+
+    async def set_player_rank(self, guild_id: int, user_id: int, rank: str) -> None:
+        if rank not in SERVER_RANKS:
+            raise ValueError("Invalid rank")
+        await self._execute(
+            """
+            INSERT INTO players (guild_id, user_id, server_rank)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET server_rank=EXCLUDED.server_rank, updated_at=NOW();
+            """,
+            (guild_id, user_id, rank),
+        )
+
+    # -------- Characters --------
+
+    async def add_character(self, guild_id: int, user_id: int, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError("Character name cannot be empty.")
+
+        await self._execute(
+            """
+            INSERT INTO characters (guild_id, user_id, name, archived, legacy_plus, legacy_minus, lifetime_plus, lifetime_minus, influence_plus, influence_minus, ability_stars, updated_at)
+            VALUES (%s, %s, %s, FALSE, 0, 0, 0, 0, 0, 0, 0, NOW())
+            ON CONFLICT (guild_id, user_id, name)
+            DO UPDATE SET archived=FALSE, updated_at=NOW();
+            """,
+            (guild_id, user_id, name),
+        )
+
+        await self._execute(
+            "INSERT INTO players (guild_id, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+            (guild_id, user_id),
+        )
+
+    async def set_character_archived(self, guild_id: int, user_id: int, character_name: str, archived: bool) -> bool:
+        """Archive/unarchive a character. Returns True if a row was updated."""
+        sql = """
+            UPDATE characters
+               SET archived=%s,
+                   updated_at=NOW()
+             WHERE guild_id=%s
+               AND user_id=%s
+               AND name=%s;
+        """
+        rowcount = await self._execute(sql, (archived, guild_id, user_id, character_name))
+        return bool(rowcount and rowcount > 0)
+    async def character_exists(self, guild_id: int, user_id: int, name: str) -> bool:
+        row = await self._fetchone(
+            "SELECT 1 FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s AND COALESCE(archived, FALSE)=FALSE LIMIT 1;",
+            (guild_id, user_id, name.strip()),
+        )
+        return bool(row)
+
+    async def list_characters(self, guild_id: int, user_id: int) -> List[str]:
+        rows = await self._fetchall(
+            """
+            SELECT name
+            FROM characters
+            WHERE guild_id=%s AND user_id=%s AND COALESCE(archived, FALSE)=FALSE
+            ORDER BY created_at ASC, name ASC;
+            """,
+            (guild_id, user_id),
+        )
+        return [str(r["name"]) for r in rows if r and r.get("name")]
+
+    async def list_player_ids(self, guild_id: int) -> List[int]:
+        rows = await self._fetchall(
+            """
+            SELECT DISTINCT user_id
+            FROM characters
+            WHERE guild_id=%s AND COALESCE(archived, FALSE)=FALSE
+            ORDER BY user_id ASC;
+            """,
+            (guild_id,),
+        )
+        return [int(r["user_id"]) for r in rows if r and r.get("user_id") is not None]
+
+    async def get_character_state(self, guild_id: int, user_id: int, name: str) -> Dict[str, int]:
+        row = await self._fetchone(
+            """
+            SELECT legacy_plus, legacy_minus, lifetime_plus, lifetime_minus,
+                   influence_plus, influence_minus, ability_stars
+            FROM characters
+            WHERE guild_id=%s AND user_id=%s AND name=%s AND COALESCE(archived, FALSE)=FALSE
+            LIMIT 1;
+            """,
+            (guild_id, user_id, name.strip()),
+        )
+        if not row:
+            raise ValueError("Character not found.")
+        return {
+            "legacy_plus": safe_int(row.get("legacy_plus"), 0),
+            "legacy_minus": safe_int(row.get("legacy_minus"), 0),
+            "lifetime_plus": safe_int(row.get("lifetime_plus"), 0),
+            "lifetime_minus": safe_int(row.get("lifetime_minus"), 0),
+            "influence_plus": safe_int(row.get("influence_plus"), 0),
+            "influence_minus": safe_int(row.get("influence_minus"), 0),
+            "ability_stars": safe_int(row.get("ability_stars"), 0),
+        }
+
+    async def award_legacy(self, guild_id: int, user_id: int, name: str, pos: int = 0, neg: int = 0) -> None:
+        pos = max(0, int(pos))
+        neg = max(0, int(neg))
+        await self._execute(
+            """
+            UPDATE characters
+            SET legacy_plus = legacy_plus + %s,
+                legacy_minus = legacy_minus + %s,
+                lifetime_plus = lifetime_plus + %s,
+                lifetime_minus = lifetime_minus + %s,
+                updated_at = NOW()
+            WHERE guild_id=%s AND user_id=%s AND name=%s AND COALESCE(archived, FALSE)=FALSE;
+            """,
+            (pos, neg, pos, neg, guild_id, user_id, name.strip()),
+        )
+
+    async def spend_legacy(self, guild_id: int, user_id: int, name: str, pool: str, amount: int) -> None:
+        amount = max(0, int(amount))
+        pool = pool.strip().lower()
+        st = await self.get_character_state(guild_id, user_id, name)
+        if pool == "positive":
+            if st["legacy_plus"] < amount:
+                raise ValueError(f"Not enough available positive points (need {amount}, have {st['legacy_plus']}).")
+            await self._execute(
+                "UPDATE characters SET legacy_plus=legacy_plus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (amount, guild_id, user_id, name.strip()),
+            )
+        elif pool == "negative":
+            if st["legacy_minus"] < amount:
+                raise ValueError(f"Not enough available negative points (need {amount}, have {st['legacy_minus']}).")
+            await self._execute(
+                "UPDATE characters SET legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (amount, guild_id, user_id, name.strip()),
+            )
+        else:
+            raise ValueError("pool must be positive or negative")
+
+    async def convert_star(
+        self,
+        guild_id: int,
+        user_id: int,
+        name: str,
+        star_type: Literal['ability','influence_positive','influence_negative'],
+        stars: int,
+        spend_plus: int,
+        spend_minus: int,
+    ) -> None:
+        """Convert AVAILABLE legacy points into stars (stars are assigned, never consumed).
+
+        Costs:
+          - ability: 10 total points per star (can split + and -)
+          - influence_positive: 10 positive points per star (no split)
+          - influence_negative: 10 negative points per star (no split)
+
+        Caps:
+          - ability_stars max 5
+          - total influence stars (influence_plus + influence_minus) max 5
+        """
+        star_type = star_type.strip().lower()
+        name = name.strip()
+        stars = int(stars)
+        spend_plus = int(spend_plus)
+        spend_minus = int(spend_minus)
+
+        if stars < 1:
+            raise ValueError("stars must be >= 1")
+        if spend_plus < 0 or spend_minus < 0:
+            raise ValueError("Spend amounts must be >= 0")
+
+        st = await self.get_character_state(guild_id, user_id, name)
+        infl_total = st["influence_plus"] + st["influence_minus"]
+        total_cost = STAR_COST * stars
+
+        if star_type == "ability":
+            if st["ability_stars"] + stars > MAX_ABILITY_STARS:
+                raise ValueError("Ability stars already at max (5).")
+            if spend_plus + spend_minus != total_cost:
+                raise ValueError(f"Ability stars cost {total_cost} total points. Provide spend_plus + spend_minus = {total_cost}.")
+        elif star_type == "influence_positive":
+            if infl_total + stars > MAX_INFL_STARS_TOTAL:
+                raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+            if spend_plus != total_cost or spend_minus != 0:
+                raise ValueError(f"Positive influence stars cost {total_cost} POSITIVE points. Provide spend_plus={total_cost}, spend_minus=0.")
+        elif star_type == "influence_negative":
+            if infl_total + stars > MAX_INFL_STARS_TOTAL:
+                raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+            if spend_minus != total_cost or spend_plus != 0:
+                raise ValueError(f"Negative influence stars cost {total_cost} NEGATIVE points. Provide spend_plus=0, spend_minus={total_cost}.")
+        else:
+            raise ValueError("star_type must be ability, influence_positive, or influence_negative")
+
+        if spend_plus > st["legacy_plus"]:
+            raise ValueError(f"Not enough available positive points (need {spend_plus}, have {st['legacy_plus']}).")
+        if spend_minus > st["legacy_minus"]:
+            raise ValueError(f"Not enough available negative points (need {spend_minus}, have {st['legacy_minus']}).")
+
+        # Spend ONLY from AVAILABLE pools
+        await self._execute(
+            "UPDATE characters SET legacy_plus=legacy_plus-%s, legacy_minus=legacy_minus-%s, updated_at=NOW() "
+            "WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (spend_plus, spend_minus, guild_id, user_id, name),
+        )
+
+        # Apply stars
+        if star_type == "ability":
+            await self._execute(
+                "UPDATE characters SET ability_stars=ability_stars+%s, updated_at=NOW() "
+                "WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (stars, guild_id, user_id, name),
+            )
+        elif star_type == "influence_positive":
+            await self._execute(
+                "UPDATE characters SET influence_plus=influence_plus+%s, updated_at=NOW() "
+                "WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (stars, guild_id, user_id, name),
+            )
+        else:  # influence_negative
+            await self._execute(
+                "UPDATE characters SET influence_minus=influence_minus+%s, updated_at=NOW() "
+                "WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (stars, guild_id, user_id, name),
+            )
+
+    async def reset_points(self, guild_id: int, user_id: int, name: str,
+                           legacy_plus: Optional[int], legacy_minus: Optional[int],
+                           lifetime_plus: Optional[int], lifetime_minus: Optional[int]) -> None:
+        st = await self.get_character_state(guild_id, user_id, name)
+        lp = st["legacy_plus"] if legacy_plus is None else max(0, int(legacy_plus))
+        lm = st["legacy_minus"] if legacy_minus is None else max(0, int(legacy_minus))
+        ltp = st["lifetime_plus"] if lifetime_plus is None else max(0, int(lifetime_plus))
+        ltm = st["lifetime_minus"] if lifetime_minus is None else max(0, int(lifetime_minus))
+        await self._execute(
+            """
+            UPDATE characters
+            SET legacy_plus=%s, legacy_minus=%s, lifetime_plus=%s, lifetime_minus=%s, updated_at=NOW()
+            WHERE guild_id=%s AND user_id=%s AND name=%s;
+            """,
+            (lp, lm, ltp, ltm, guild_id, user_id, name.strip()),
+        )
+
+    async def reset_stars(self, guild_id: int, user_id: int, name: str,
+                          ability_stars: Optional[int], infl_plus: Optional[int], infl_minus: Optional[int]) -> None:
+        st = await self.get_character_state(guild_id, user_id, name)
+        a = st["ability_stars"] if ability_stars is None else clamp(int(ability_stars), 0, MAX_ABILITY_STARS)
+        ip = st["influence_plus"] if infl_plus is None else clamp(int(infl_plus), 0, MAX_INFL_STARS_TOTAL)
+        im = st["influence_minus"] if infl_minus is None else clamp(int(infl_minus), 0, MAX_INFL_STARS_TOTAL)
+        if ip + im > MAX_INFL_STARS_TOTAL:
+            raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+        await self._execute(
+            """
+            UPDATE characters
+            SET ability_stars=%s, influence_plus=%s, influence_minus=%s, updated_at=NOW()
+            WHERE guild_id=%s AND user_id=%s AND name=%s;
+            """,
+            (a, ip, im, guild_id, user_id, name.strip()),
+        )
+
+    # -------- Abilities (schema-flex) --------
+
+    def _ability_level_expr(self) -> str:
+        # We always SELECT as "upgrade_level" to keep renderer stable
+        if self.abilities_level_col == "upgrade_level":
+            return "COALESCE(upgrade_level, 0) AS upgrade_level"
+        return "COALESCE(level, 0) AS upgrade_level"
+
+    def _ability_where_char(self) -> str:
+        return self.abilities_char_col
+
+    async def list_abilities(self, guild_id: int, user_id: int, name: str) -> List[Tuple[str, int]]:
+        # If schema changed since startup, re-detect once
+        try:
+            rows = await self._fetchall(
+                f"""
+                SELECT ability_name, {self._ability_level_expr()}
+                FROM abilities
+                WHERE guild_id=%s AND user_id=%s AND {self._ability_where_char()}=%s
+                ORDER BY created_at ASC, ability_name ASC;
+                """,
+                (guild_id, user_id, name.strip()),
+            )
+        except Exception:
+            # Last-resort: refresh detection and retry once
+            await self.detect_schema()
+            rows = await self._fetchall(
+                f"""
+                SELECT ability_name, {self._ability_level_expr()}
+                FROM abilities
+                WHERE guild_id=%s AND user_id=%s AND {self._ability_where_char()}=%s
+                ORDER BY created_at ASC, ability_name ASC;
+                """,
+                (guild_id, user_id, name.strip()),
+            )
+
+        out: List[Tuple[str, int]] = []
+        for r in rows:
+            if r and r.get("ability_name"):
+                out.append((str(r["ability_name"]), safe_int(r.get("upgrade_level"), 0)))
+        return out
+
+    async def add_ability(self, guild_id: int, user_id: int, name: str, ability_name: str) -> None:
+        ability_name = ability_name.strip()
+        if not ability_name:
+            raise ValueError("Ability name cannot be empty.")
+        st = await self.get_character_state(guild_id, user_id, name)
+        current = await self.list_abilities(guild_id, user_id, name)
+        cap = 2 + clamp(st["ability_stars"], 0, MAX_ABILITY_STARS)
+        if len(current) >= cap:
+            raise ValueError(f"Ability capacity reached ({len(current)}/{cap}). Earn more Ability Stars to add abilities.")
+
+        # Insert using whatever character column exists; also initialize both level columns if present.
+        char_col = self._ability_where_char()
+        cols = ["guild_id", "user_id", char_col, "ability_name", "created_at"]
+        vals = ["%s", "%s", "%s", "%s", "NOW()"]
+        params: List[Any] = [guild_id, user_id, name.strip(), ability_name]
+
+        if "upgrade_level" in self.abilities_cols:
+            cols.append("upgrade_level")
+            vals.append("0")
+        if "level" in self.abilities_cols:
+            cols.append("level")
+            vals.append("0")
+
+        sql = "INSERT INTO abilities (" + ", ".join(cols) + ") VALUES (" + ", ".join(vals) + ");"
+        await self._execute(sql, params)
+
+
+    async def upgrade_ability(
+        self,
+        guild_id: int,
+        user_id: int,
+        name: str,
+        ability_name: str,
+        upgrades: int,
+        pay_positive: int,
+        pay_negative: int,
+    ) -> Tuple[int, int]:
+        """Apply ability upgrades (max 5 per ability). Each upgrade costs 5 legacy points.
+        Points may be paid using any mix of positive/negative AVAILABLE legacy points, but the caller must specify the split.
+        This method NEVER touches lifetime totals.
+        """
+        ability_name = ability_name.strip()
+        upgrades = max(1, int(upgrades))
+        pay_positive = max(0, int(pay_positive))
+        pay_negative = max(0, int(pay_negative))
+
+        if upgrades < 1:
+            raise ValueError("upgrades must be >= 1")
+
+        total_cost = upgrades * MINOR_UPGRADE_COST
+        if pay_positive + pay_negative != total_cost:
+            raise ValueError(f"Payment must equal {total_cost} points total (5 per upgrade).")
+
+        char_col = self._ability_where_char()
+        level_col = self.abilities_level_col
+
+        row = await self._fetchone(
+            f"""
+            SELECT COALESCE({level_col}, 0) AS cur_level
+            FROM abilities
+            WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s
+            ORDER BY created_at ASC
+            LIMIT 1;
+            """,
+            (guild_id, user_id, name.strip(), ability_name),
+        )
+        if not row:
+            raise ValueError("Ability not found. Add it first with /add_ability.")
+        cur_level = safe_int(row.get("cur_level"), 0)
+
+        max_level = 5
+        if cur_level >= max_level:
+            raise ValueError(f"Upgrade limit reached ({cur_level}/{max_level}).")
+
+        # Clamp requested upgrades to remaining cap
+        remaining = max_level - cur_level
+        if upgrades > remaining:
+            raise ValueError(f"Only {remaining} upgrade(s) remaining for this ability (max {max_level}).")
+
+        # Validate available pools and deduct ONLY from available points
+        st = await self.get_character_state(guild_id, user_id, name)
+        if st["legacy_plus"] < pay_positive:
+            raise ValueError(f"Not enough available positive points (need {pay_positive}, have {st['legacy_plus']}).")
+        if st["legacy_minus"] < pay_negative:
+            raise ValueError(f"Not enough available negative points (need {pay_negative}, have {st['legacy_minus']}).")
+
+        if pay_positive:
+            await self._execute(
+                "UPDATE characters SET legacy_plus=legacy_plus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (pay_positive, guild_id, user_id, name.strip()),
+            )
+        if pay_negative:
+            await self._execute(
+                "UPDATE characters SET legacy_minus=legacy_minus-%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s;",
+                (pay_negative, guild_id, user_id, name.strip()),
+            )
+
+        new_level = cur_level + upgrades
+
+        # Update the detected column, and also keep the other column in sync if present
+        sets: List[str] = [f"{level_col}=%s"]
+        params: List[Any] = [new_level]
+
+        if level_col != "upgrade_level" and "upgrade_level" in self.abilities_cols:
+            sets.append("upgrade_level=%s")
+            params.append(new_level)
+        if level_col != "level" and "level" in self.abilities_cols:
+            sets.append("level=%s")
+            params.append(new_level)
+
+        params.extend([guild_id, user_id, name.strip(), ability_name])
+        sql = f"UPDATE abilities SET {', '.join(sets)} WHERE guild_id=%s AND user_id=%s AND {char_col}=%s AND ability_name=%s;"
+        await self._execute(sql, params)
+        return new_level, max_level
+
+    # -------- Dashboard message tracking --------
+
+    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional[Any]]:
+        """Return (message_ids, content_hash, updated_at). Falls back gracefully if content_hash doesn't exist."""
+        try:
+            row = await self._fetchone(
+                "SELECT message_ids, content_hash, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                (guild_id, user_id),
+            )
+            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+            h = str(row["content_hash"]) if row and row.get("content_hash") else None
+            ts = row["updated_at"] if row and row.get("updated_at") else None
+            return ids, h, ts
+        except psycopg.errors.UndefinedColumn:
+            row = await self._fetchone(
+                "SELECT message_ids, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                (guild_id, user_id),
+            )
+            ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
+            ts = row["updated_at"] if row and row.get("updated_at") else None
+            return ids, None, ts
+
+    async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
+        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
+        return ids
+
+    async def set_dashboard_message_ids(
+        self,
+        guild_id: int,
+        user_id: int,
+        channel_id: int,
+        ids: List[int],
+        h: Optional[str] = None,
+    ) -> None:
+        """Persist dashboard message IDs (and optional content hash) for a player."""
+        try:
+            await self._execute(
+                """
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                              message_ids=EXCLUDED.message_ids,
+                              content_hash=EXCLUDED.content_hash,
+                              updated_at=NOW();
+                """,
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
+            )
+        except psycopg.errors.UndefinedColumn:
+            await self._execute(
+                """
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                              message_ids=EXCLUDED.message_ids,
+                              updated_at=NOW();
+                """,
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None),
+            )
+
+    async def clear_dashboard_message_ids(self, guild_id: int, user_id: int) -> None:
+        await self._execute(
+            "DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+            (guild_id, user_id),
+        )
+
+    async def get_latest_player_data_updated_at(self, guild_id: int, user_id: int) -> Optional[Any]:
+        """Max updated_at across characters + abilities for this player."""
+        row = await self._fetchone(
+            """
+            SELECT GREATEST(
+                COALESCE((SELECT MAX(updated_at) FROM characters WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
+                COALESCE((SELECT MAX(updated_at) FROM abilities WHERE guild_id=%s AND user_id=%s), to_timestamp(0)),
+                COALESCE((SELECT MAX(updated_at) FROM players WHERE guild_id=%s AND user_id=%s), to_timestamp(0))
+            ) AS ts
+            """,
+            (guild_id, user_id, guild_id, user_id, guild_id, user_id),
+        )
+        return row["ts"] if row else None
+
+
+    # -------- Dashboard message tracking --------
+
+
+@dataclass
+class CharacterCard:
+    name: str
+    legacy_plus: int
+    legacy_minus: int
+    lifetime_plus: int
+    lifetime_minus: int
+    ability_stars: int
+    infl_plus: int
+    infl_minus: int
+    abilities: List[Tuple[str, int]]  # (ability_name, upgrades/level)
+
+
+async def build_character_card(db: Database, guild_id: int, user_id: int, name: str) -> CharacterCard:
+    st = await db.get_character_state(guild_id, user_id, name)
+    abilities = await db.list_abilities(guild_id, user_id, name)
+    return CharacterCard(
+        name=name,
+        legacy_plus=st["legacy_plus"],
+        legacy_minus=st["legacy_minus"],
+        lifetime_plus=st["lifetime_plus"],
+        lifetime_minus=st["lifetime_minus"],
+        ability_stars=st["ability_stars"],
+        infl_plus=st["influence_plus"],
+        infl_minus=st["influence_minus"],
+        abilities=abilities,
+    )
+
+
+def render_character_block(card: CharacterCard) -> str:
+    net_lifetime = card.lifetime_plus - card.lifetime_minus
+    lines: List[str] = []
+    # Keep the decorative header but bold the name and add spacing so it doesn't wrap awkwardly on mobile
+    lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
+    lines.append("")  # spacer line between header and stats
+    lines.append(f"Legacy Points: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
+    lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
+    lines.append("Influence Stars: " + render_influence_star_bar(card.infl_minus, card.infl_plus))
+    lines.append(render_reputation_block(net_lifetime))
+    if card.abilities:
+        parts = [f"{nm} ({lvl})" for nm, lvl in card.abilities]
+        lines.append("Abilities: " + " | ".join(parts))
+    else:
+        lines.append("Abilities: _none set_")
+    return "\n".join(lines).strip()
+
+
+
+async def render_player_post(db: Database, guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    nickname = member.display_name if member else f"User {user_id}"
+    rank = await db.get_player_rank(guild.id, user_id)
+
+    chars = await db.list_characters(guild.id, user_id)
+    if not chars:
+        return ""
+
+    lines: List[str] = []
+    lines.append(PLAYER_BORDER)
+    lines.append(f"__***{nickname}***__")
+    lines.append(f"__***Server Rank: {rank}***__")
+    lines.append("")
+
+    for i, cname in enumerate(chars):
+        card = await build_character_card(db, guild.id, user_id, cname)
+        lines.append(render_character_block(card))
+        if i != len(chars) - 1:
+            lines.append("")
+            lines.append(CHAR_SEPARATOR)
+            lines.append("")
+
+    lines.append(PLAYER_BORDER)
+
+    content = "\n".join(lines).rstrip()
+    if len(content) > PLAYER_POST_SOFT_LIMIT:
+        truncated = content[:PLAYER_POST_SOFT_LIMIT - 60]
+        cut = truncated.rfind("\n")
+        if cut > 0:
+            truncated = truncated[:cut]
+        content = truncated.rstrip() + "\n\n…(truncated: too many characters to fit in one post)"
+    return content
+
+
+async def get_dashboard_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    ch_id = safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID)
+    ch = guild.get_channel(ch_id)
+    if ch is None:
+        try:
+            ch = await guild.fetch_channel(ch_id)
+        except Exception:
+            ch = None
+    return ch if isinstance(ch, discord.TextChannel) else None
+
+
+async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Guild, user_id: int) -> str:
+    db = client.db
+    channel = await get_dashboard_channel(guild)
+    if not channel:
+        return "Dashboard channel not found or not a text channel."
+
+    me = guild.me or (guild.get_member(client.user.id) if client.user else None)
+    if me:
+        perms = channel.permissions_for(me)
+        if not (perms.view_channel and perms.send_messages):
+            return f"Missing permissions in <#{channel.id}>: need View Channel + Send Messages."
+
+    chars = await db.list_characters(guild.id, user_id)
+    stored_ids, stored_hash, dash_ts = await db.get_dashboard_entry(guild.id, user_id)
+
+    # Skip startup refresh for this player if nothing changed since last dashboard update.
+    try:
+        latest_ts = await db.get_latest_player_data_updated_at(guild.id, user_id)
+        if dash_ts and latest_ts and latest_ts <= dash_ts:
+            LOG.info(
+                "Dashboard up-to-date for user_id=%s (latest_ts=%s <= dash_ts=%s); skipping.",
+                user_id,
+                latest_ts,
+                dash_ts,
+            )
+            return "skipped"
+    except Exception as ex:
+        LOG.warning("Could not compute latest player data timestamp for user_id=%s: %s", user_id, ex)
+
+    if not chars:
+        for mid in stored_ids:
+            try:
+                m = await channel.fetch_message(mid)
+                await m.delete()
+            except Exception:
+                pass
+        await db.clear_dashboard_message_ids(guild.id, user_id)
+        return f"No characters for user_id={user_id}; dashboard entry cleared."
+
+    content = await render_player_post(db, guild, user_id)
+    if not content:
+        return f"No content rendered for user_id={user_id}."
+
+    new_hash = content_hash(content)
+
+    msg: Optional[discord.Message] = None
+    if stored_ids:
+        try:
+            msg = await channel.fetch_message(stored_ids[0])
+        except Exception:
+            msg = None
+
+    if msg is None:
+        await client.dashboard_limiter.wait()
+        msg = await channel.send(content)
+        await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id], new_hash)
+        return f"Dashboard created for user_id={user_id}."
+    else:
+        await client.dashboard_limiter.wait()
+        await msg.edit(content=content)
+        if len(stored_ids) > 1:
+            for extra_id in stored_ids[1:]:
+                try:
+                    extra_msg = await channel.fetch_message(extra_id)
+                    await extra_msg.delete()
+                except Exception:
+                    pass
+            await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id], new_hash)
+        await db.set_dashboard_message_ids(guild.id, user_id, channel.id, [msg.id], new_hash)
+        return f"Dashboard updated for user_id={user_id}."
+
+
+async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild) -> str:
+    user_ids = await client.db.list_player_ids(guild.id)
+    if not user_ids:
+        return "No players with characters yet."
+    ok = 0
+    for uid in user_ids:
+        await refresh_player_dashboard(client, guild, uid)
+        ok += 1
+        # gentle spacing between players (prevents burst edits on startup)
+        await asyncio.sleep(0.2)
+    return f"Refreshed dashboards for {ok} player(s)."
+
+
+# -----------------------------
+# Command guards
+# -----------------------------
+
+def staff_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
+        if isinstance(interaction.user, discord.Member) and is_staff(interaction.user):
+            return True
+        await safe_reply(interaction, "Staff only (Guardian/Warden).")
+        return False
     return app_commands.check(predicate)
 
 
-# -------------------------
-# Autocomplete
-# -------------------------
-async def character_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    if not LEGACY_SOURCE_GUILD_ID:
-        return []
-    names = await search_characters(int(LEGACY_SOURCE_GUILD_ID), current or "", limit=25)
-    return [app_commands.Choice(name=n, value=n) for n in names[:25]]
+def in_guild_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await safe_reply(interaction, "This command can only be used in a server.")
+            return False
+        return True
+    return app_commands.check(predicate)
 
 
-async def owned_asset_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    # expects "character" to be in namespace
-    char = str(getattr(interaction.namespace, "character", "") or "").strip()
-    if not char or not LEGACY_SOURCE_GUILD_ID:
-        return []
-    assets = await fetch_assets_owned(int(LEGACY_SOURCE_GUILD_ID), char)
-    cur = (current or "").lower().strip()
-    names = []
-    for a in assets:
-        nm = str(a.get("asset_name", "")).strip()
-        if not nm:
-            continue
-        if not cur or cur in nm.lower():
-            names.append(nm)
-    names = sorted(set(names))[:25]
-    return [app_commands.Choice(name=n, value=n) for n in names]
+async def require_character(db: Database, guild_id: int, user_id: int, name: str) -> None:
+    if not await db.character_exists(guild_id, user_id, name):
+        raise ValueError("Character not found for that user.")
 
 
-# -------------------------
-# Commands
-# -------------------------
-COMMAND_HELP_LINES = [
-    "Player Commands",
-    "/balance — Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard.",
-    "/income — Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.",
-    "",
-    "Staff Commands",
-    "/econ_adjust — Staff-only. Add or subtract money from a character. The bot will not allow balances to go negative.",
-    "/econ_set_balance — Staff-only. Set a character’s balance to an exact amount (non-negative). Useful for corrections.",
-    "/econ_purchase_new — Staff-only. Buy a new asset at a chosen tier (cost is tier 1 + ... + target tier, per NEW Asset Table).",
-    "/econ_refresh_bank — Staff-only. Force-refresh the Bank of Vilyra dashboard.",
-    "/econ_commands — Staff-only. Shows this command list with short descriptions (kept updated as we add features).",
-]
+# -----------------------------
+# Slash commands
+# -----------------------------
+
+@app_commands.command(name="set_server_rank", description="(Staff) Set a player's server rank.")
+@in_guild_only()
+@staff_only()
+async def set_server_rank(interaction: discord.Interaction, user: discord.Member, rank: str):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        rank = rank.strip()
+        if rank not in SERVER_RANKS:
+            await safe_reply(interaction, "Invalid rank. Options: " + ", ".join(SERVER_RANKS))
+            return
+        await run_db(interaction.client.db.set_player_rank(interaction.guild.id, user.id, rank), "set_server_rank")
+        await log_to_channel(interaction.guild, f"🏷️ {interaction.user.mention} set server rank for {user.mention} to **{rank}**")
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Rank set. " + status)
+    except Exception as e:
+        LOG.exception("set_server_rank failed")
+        await safe_reply(interaction, f"Set rank failed: {e}")
 
 
-
-@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.")
-@require_admin()
-async def econ_commands_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    em = discord.Embed(title="EconBot Commands", description="Quick reference (kept updated as we build).")
-    public = []
-    staff = []
-    for name, desc in COMMAND_HELP_LINES:
-        line = f"**/{name}** — {desc}"
-        if name in {"balance", "income"}:
-            public.append(line)
-        else:
-            staff.append(line)
-
-    if public:
-        em.add_field(name="Player Commands", value="\n".join(public), inline=False)
-    if staff:
-        em.add_field(name="Staff Commands", value="\n".join(staff), inline=False)
-
-    em.set_footer(text=VERSION)
-    await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+@app_commands.command(name="add_character", description="(Staff) Add a character under a player.")
+@in_guild_only()
+@staff_only()
+async def add_character(interaction: discord.Interaction, user: discord.Member, character_name: str):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        await run_db(interaction.client.db.add_character(interaction.guild.id, user.id, character_name), "add_character")
+        await log_to_channel(interaction.guild, f"➕ {interaction.user.mention} added character **{character_name.strip()}** under {user.mention}")
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Character added. " + status)
+    except Exception as e:
+        LOG.exception("add_character failed")
+        await safe_reply(interaction, f"Add character failed: {e}")
 
 
-@tree.command(name="balance", description="Show a character’s money + assets.")
-@app_commands.describe(character="Pick a character")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def balance_cmd(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
+@app_commands.command(name="character_add", description="(Staff) Alias for /add_character (compatibility).")
+@in_guild_only()
+@staff_only()
+async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str):
+    await add_character(interaction, user, character_name)
 
-    if not LEGACY_SOURCE_GUILD_ID:
-        await interaction.followup.send("LEGACY_SOURCE_GUILD_ID is not set.", ephemeral=True)
+
+@app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character (hide/show on dashboard).")
+@app_commands.guild_only()
+@staff_only()
+@app_commands.describe(user="Player who owns the character", character_name="Character to archive/unarchive")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Archive", value="archive"),
+    app_commands.Choice(name="Unarchive", value="unarchive"),
+])
+async def character_archive(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    action: app_commands.Choice[str],
+):
+    """Archive/unarchive a character. Archived characters are hidden from dashboard + cards."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    do_archive = (action.value == "archive")
+
+    ok = await run_db(
+        interaction.client.db.set_character_archived(interaction.guild.id, user.id, character_name, do_archive),
+        "set_character_archived",
+    )
+    if not ok:
+        await interaction.followup.send(f"Character not found: **{character_name}**", ephemeral=True)
         return
 
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
-        await interaction.followup.send("Character not found.", ephemeral=True)
+    status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+    # Command log
+    verb = "archived" if do_archive else "unarchived"
+    await log_to_channel(
+        interaction.guild,
+        f"🗄 {interaction.user.mention} {verb} **{character_name}** for {user.mention}",
+    )
+
+    await interaction.followup.send(f"✅ {verb.title()} **{character_name}**. {status}", ephemeral=True)
+
+
+
+
+@app_commands.command(name="character_archive_by_id", description="(Staff) Archive/unarchive a character by user ID (use for players who left).")
+@in_guild_only()
+@staff_only()
+@app_commands.describe(
+    user_id="Discord user ID of the player (numbers only).",
+    character_name="Exact character name to archive/unarchive.",
+    action="Archive hides the character from the dashboard; Unarchive shows it again.",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="Archive", value="archive"),
+        app_commands.Choice(name="Unarchive", value="unarchive"),
+    ]
+)
+async def character_archive_by_id(
+    interaction: discord.Interaction,
+    user_id: str,
+    character_name: str,
+    action: app_commands.Choice[str],
+):
+    """
+    Archive/unarchive a character when you can't pick the user via Discord's user picker (e.g., they left the server).
+    """
+    await defer_ephemeral(interaction)
+
+    uid_str = (user_id or "").strip()
+    if not uid_str.isdigit():
+        await interaction.followup.send("❌ `user_id` must be numbers only (a Discord user ID).", ephemeral=True)
+        return
+    uid = int(uid_str)
+
+    do_archive = (action.value == "archive")
+    try:
+        status = await run_db(
+            interaction.client.db.set_character_archived(interaction.guild.id, uid, character_name, do_archive),
+            "set_character_archived",
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Archive failed: {e}", ephemeral=True)
         return
 
-    bal = await get_balance_val(ch.guild_id, ch.name)
-    assets = await fetch_assets_owned(ch.guild_id, ch.name)
+    # Update dashboard for that user id (even if the user isn't in guild anymore, the post is keyed by user_id)
+    try:
+        dash_status = await refresh_player_dashboard(interaction.client, interaction.guild, uid)
+    except Exception as e:
+        dash_status = f"(Dashboard refresh failed: {e})"
 
-    em = discord.Embed(title=f"{ch.name}", description=f"**Balance:** {format_money(bal)}")
-    em.add_field(name="__*Assets*__", value=format_assets_lines(assets), inline=False)
-    em.set_footer(text=VERSION)
-    await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    verb = "archived" if do_archive else "unarchived"
+    await log_to_channel(
+        interaction.guild,
+        f"🗄 {interaction.user.mention} {verb} **{character_name}** for user_id={uid}",
+    )
+
+    await interaction.followup.send(f"✅ {verb.title()} **{character_name}** for user_id={uid}. {dash_status}", ephemeral=True)
+
+@app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
+@in_guild_only()
+@staff_only()
+async def award_legacy_points(interaction: discord.Interaction, user: discord.Member, character_name: str, positive: int = 0, negative: int = 0):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
+        if positive < 0 or negative < 0:
+            await safe_reply(interaction, "Points must be >= 0.")
+            return
+        if positive == 0 and negative == 0:
+            await safe_reply(interaction, "Provide positive and/or negative points to award.")
+            return
+        await run_db(interaction.client.db.award_legacy(interaction.guild.id, user.id, character_name, pos=positive, neg=negative), "award_legacy")
+        await log_to_channel(interaction.guild, f"🏅 {interaction.user.mention} awarded **{character_name}** ({user.mention}) legacy: +{positive} / -{negative}")
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Awarded. " + status)
+    except Exception as e:
+        LOG.exception("award_legacy_points failed")
+        await safe_reply(interaction, f"Award failed: {e}")
 
 
-@tree.command(name="income", description="Owner-only: claim daily income for your character (Chicago time).")
-@app_commands.describe(character="Pick one of your characters")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def income_cmd(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
 
-    if not (DATABASE_URL and LEGACY_SOURCE_GUILD_ID):
-        await interaction.followup.send("Database is not configured.", ephemeral=True)
-        return
+async def _handle_convert_star_interaction(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    star_type: str,
+    stars: int,
+    spend_positive: int,
+    spend_negative: int,
+) -> None:
+    """Shared implementation for /convert_star and /convert_points_to_stars."""
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        star_type = str(star_type).strip().lower()
 
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
-        await interaction.followup.send("Character not found.", ephemeral=True)
-        return
+        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
 
-    if interaction.user.id != ch.user_id:
-        await interaction.followup.send("You can only claim income for characters you own.", ephemeral=True)
-        return
+        await run_db(
+            interaction.client.db.convert_star(
+                interaction.guild.id,
+                user.id,
+                character_name,
+                star_type,
+                stars,
+                spend_positive,
+                spend_negative,
+            ),
+            "convert_star",
+        )
 
-    today = dt.datetime.now(TZ).date()
+        await log_to_channel(
+            interaction.guild,
+            f"⭐ {interaction.user.mention} converted legacy -> **{star_type}** x{stars} for **{character_name}** ({user.mention}) (spent +{spend_positive}/-{spend_negative})",
+        )
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Converted. " + status)
+    except Exception as e:
+        LOG.exception("convert_star failed")
+        await safe_reply(interaction, f"Convert failed: {e}")
 
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        async with con.transaction():
-            exists = await con.fetchrow(
-                "SELECT 1 FROM economy.income_claims WHERE guild_id=$1 AND character_name=$2 AND claim_date=$3",
-                int(ch.guild_id),
-                str(ch.name),
-                today,
-            )
-            if exists:
-                await interaction.followup.send("Income already claimed for today.", ephemeral=True)
+
+@app_commands.command(name="convert_star", description="(Staff) Convert available legacy points into stars (10 points per star).")
+@app_commands.choices(star_type=[
+    app_commands.Choice(name="Ability Star", value="ability"),
+    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
+    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
+])
+@in_guild_only()
+@staff_only()
+async def convert_star(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    star_type: Literal['ability','influence_positive','influence_negative'],
+    stars: int,
+    spend_positive: int,
+    spend_negative: int,
+):
+    await _handle_convert_star_interaction(interaction, user, character_name, star_type, stars, spend_positive, spend_negative)
+
+@app_commands.command(name="convert_points_to_stars", description="(Staff) Convert available legacy points into stars (10 points per star).")
+@app_commands.choices(star_type=[
+    app_commands.Choice(name="Ability Star", value="ability"),
+    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
+    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
+])
+@in_guild_only()
+@staff_only()
+async def convert_points_to_stars(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    star_type: Literal['ability','influence_positive','influence_negative'],
+    stars: int,
+    spend_positive: int,
+    spend_negative: int,
+):
+    await _handle_convert_star_interaction(interaction, user, character_name, star_type, stars, spend_positive, spend_negative)
+
+@app_commands.command(name="staff_commands", description="(Staff) Show a quick list of staff commands and what they do.")
+@in_guild_only()
+@staff_only()
+async def staff_commands(interaction: discord.Interaction):
+    """Ephemeral staff help: lists core staff/admin actions (no legacy/internal/debug commands)."""
+    await defer_ephemeral(interaction)
+
+    # Keep this list intentionally small and player-friendly (but staff-only).
+    items: list[tuple[str, str]] = [
+        ("/character_add", "Add a new character for a player."),
+        ("/character_archive", "Archive or unarchive a character (hide/show on the dashboard)."),
+        ("/character_archive_by_id", "Archive/unarchive by user ID (for players who left the server)."),
+        ("/award_points", "Award legacy points to a character (positive or negative)."),
+        ("/add_ability", "Add a new ability to a character (does not spend stars)."),
+        ("/upgrade_ability", "Upgrade an existing ability (costs legacy points; max 5 upgrades)."),
+        ("/convert_points_to_stars", "Convert available legacy points into stars (ability or influence)."),
+        ("/refresh_dashboard", "Force-refresh a player’s dashboard post right now."),
+        ("/char_card", "Show a character card (ephemeral) exactly like the dashboard view."),
+    ]
+
+    lines = ["**Staff Commands**", ""]
+    for cmd, desc in items:
+        lines.append(f"• **{cmd}** — {desc}")
+    await safe_reply(interaction, "\n".join(lines))
+
+
+@app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character (use for corrections).")
+@in_guild_only()
+@staff_only()
+async def reset_points(interaction: discord.Interaction, user: discord.Member, character_name: str,
+                       legacy_plus: Optional[int] = None, legacy_minus: Optional[int] = None,
+                       lifetime_plus: Optional[int] = None, lifetime_minus: Optional[int] = None):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
+        await run_db(interaction.client.db.reset_points(interaction.guild.id, user.id, character_name, legacy_plus, legacy_minus, lifetime_plus, lifetime_minus), "reset_points")
+        await log_to_channel(interaction.guild, f"🧾 {interaction.user.mention} reset points for **{character_name}** ({user.mention})")
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Reset complete. " + status)
+    except Exception as e:
+        LOG.exception("reset_points failed")
+        await safe_reply(interaction, f"Reset failed: {e}")
+
+
+@app_commands.command(name="reset_stars", description="(Staff) Set ability stars and/or influence stars for a character.")
+@in_guild_only()
+@staff_only()
+async def reset_stars(interaction: discord.Interaction, user: discord.Member, character_name: str,
+                      ability_stars: Optional[int] = None, influence_plus: Optional[int] = None, influence_minus: Optional[int] = None):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
+        await run_db(interaction.client.db.reset_stars(interaction.guild.id, user.id, character_name, ability_stars, influence_plus, influence_minus), "reset_stars")
+        await log_to_channel(interaction.guild, f"⚖️ {interaction.user.mention} reset stars for **{character_name}** ({user.mention})")
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Stars set. " + status)
+    except Exception as e:
+        LOG.exception("reset_stars failed")
+        await safe_reply(interaction, f"Reset failed: {e}")
+
+
+@app_commands.command(name="add_ability", description="(Staff) Add an ability to a character (capacity = 2 + ability stars).")
+@in_guild_only()
+@staff_only()
+async def add_ability(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_name: str):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        ability_name = ability_name.strip()
+        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
+        await run_db(interaction.client.db.add_ability(interaction.guild.id, user.id, character_name, ability_name), "add_ability")
+        await log_to_channel(interaction.guild, f"🧩 {interaction.user.mention} added ability **{ability_name}** to **{character_name}** ({user.mention})")
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Ability added. " + status)
+    except Exception as e:
+        LOG.exception("add_ability failed")
+        await safe_reply(interaction, f"Add ability failed: {e}")
+
+
+
+@app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points per upgrade (max 5 upgrades per ability). Requires explicit +/− split.")
+@in_guild_only()
+@staff_only()
+async def upgrade_ability(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    ability_name: str,
+    upgrades: int,
+    pay_positive: int,
+    pay_negative: int,
+):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        ability_name = ability_name.strip()
+
+        if upgrades < 1:
+            await safe_reply(interaction, "Upgrades must be >= 1.")
+            return
+        if pay_positive < 0 or pay_negative < 0:
+            await safe_reply(interaction, "Payment values must be >= 0.")
+            return
+
+        await run_db(require_character(interaction.client.db, interaction.guild.id, user.id, character_name), "require_character")
+        new_level, max_level = await run_db(
+            interaction.client.db.upgrade_ability(
+                interaction.guild.id,
+                user.id,
+                character_name,
+                ability_name,
+                upgrades,
+                pay_positive,
+                pay_negative,
+            ),
+            "upgrade_ability",
+        )
+        await log_to_channel(
+            interaction.guild,
+            f"🔧 {interaction.user.mention} upgraded **{ability_name}** on **{character_name}** ({user.mention}) -> {new_level}/{max_level} (paid +{pay_positive}/-{pay_negative})",
+        )
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, f"Upgraded to level {new_level}/{max_level}. {status}")
+    except Exception as e:
+        LOG.exception("upgrade_ability failed")
+        await safe_reply(interaction, f"Upgrade failed: {e}")
+
+
+
+@app_commands.command(name="refresh_dashboard", description="(Staff) Force refresh the whole dashboard.")
+@in_guild_only()
+@staff_only()
+async def refresh_dashboard(interaction: discord.Interaction):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        status = await refresh_all_dashboards(interaction.client, interaction.guild)
+        await log_to_channel(interaction.guild, f"🔄 {interaction.user.mention} refreshed the dashboard")
+        await safe_reply(interaction, status)
+    except Exception as e:
+        LOG.exception("refresh_dashboard failed")
+        await safe_reply(interaction, f"Refresh failed: {e}")
+
+
+@app_commands.command(name="char_card", description="Show a character card ephemerally.")
+@in_guild_only()
+async def char_card(interaction: discord.Interaction, character_name: str, user: Optional[discord.Member] = None):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        character_name = character_name.strip()
+        target = user or interaction.user
+
+        if user is not None:
+            if not (isinstance(interaction.user, discord.Member) and is_staff(interaction.user)):
+                embed = discord.Embed()
+                embed.set_image(url='https://media.discordapp.net/attachments/1324994929176612936/1473872568191553568/1631280-doc_brown_full.jpg?ex=6997ca4b&is=699678cb&hm=fdc25510e3a9575ccf7f1cad504c577ac1d2a6b494e2810b0425c3b9211c8e7b&=&format=webp&width=869&height=856')
+                await safe_reply(interaction, "You can only look up your own characters.", embed=embed)
                 return
 
-            asset_income = await sum_asset_income_val(ch.guild_id, ch.name)
-            total_income = int(BASE_DAILY_INCOME_VAL + asset_income)
-
-            # Apply
-            cur = await con.fetchrow(
-                "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2 FOR UPDATE",
-                int(ch.guild_id),
-                str(ch.name),
-            )
-            cur_val = int(cur["balance_val"]) if cur else 0
-            new_val = cur_val + total_income
-
-            await con.execute(
-                """
-                INSERT INTO economy.balances (guild_id, character_name, balance_val, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (guild_id, character_name)
-                DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
-                """,
-                int(ch.guild_id),
-                str(ch.name),
-                int(new_val),
-            )
-
-            await con.execute(
-                "INSERT INTO economy.income_claims (guild_id, character_name, claim_date) VALUES ($1,$2,$3)",
-                int(ch.guild_id),
-                str(ch.name),
-                today,
-            )
-
-            await con.execute(
-                """
-                INSERT INTO economy.ledger (guild_id, character_name, character_user_id, actor_user_id, kind, delta_val, reason, details_json)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                """,
-                int(ch.guild_id),
-                str(ch.name),
-                int(ch.user_id),
-                int(interaction.user.id),
-                "INCOME",
-                int(total_income),
-                "Daily income",
-                json.dumps({"base": BASE_DAILY_INCOME_VAL, "assets": asset_income}, ensure_ascii=False),
-            )
-
-    await interaction.followup.send(
-        f"Income claimed: **{format_money(total_income)}**. New balance: **{format_money(new_val)}**.",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-    asyncio.create_task(rebuild_dashboard())
-
-
-@tree.command(name="econ_adjust", description="Staff: add/subtract currency (never negative).")
-@require_admin()
-@app_commands.describe(character="Pick a character", delta_val="Delta in Val (negative subtracts)", reason="Why")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def econ_adjust_cmd(interaction: discord.Interaction, character: str, delta_val: int, reason: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    if not (DATABASE_URL and LEGACY_SOURCE_GUILD_ID):
-        await interaction.followup.send("Database is not configured.", ephemeral=True)
-        return
-
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
-        await interaction.followup.send("Character not found.", ephemeral=True)
-        return
-
-    cur = await get_balance_val(ch.guild_id, ch.name)
-    if cur + int(delta_val) < 0:
-        await interaction.followup.send("Insufficient funds (this action would make the balance negative).", ephemeral=True)
-        return
-
-    new_val = await add_balance_val(ch.guild_id, ch.name, int(delta_val))
-    await ledger_write(ch.guild_id, ch.name, ch.user_id, interaction.user.id, "ADJUST", int(delta_val), reason, {})
-
-    await interaction.followup.send(
-        f"Updated **{ch.name}**: {format_money(cur)} → **{format_money(new_val)}**.",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-    asyncio.create_task(rebuild_dashboard())
-
-
-@tree.command(name="econ_set_balance", description="Staff: set exact balance (non-negative).")
-@require_admin()
-@app_commands.describe(character="Pick a character", balance_val="Exact balance in Val", reason="Why")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def econ_set_balance_cmd(interaction: discord.Interaction, character: str, balance_val: int, reason: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    if not (DATABASE_URL and LEGACY_SOURCE_GUILD_ID):
-        await interaction.followup.send("Database is not configured.", ephemeral=True)
-        return
-
-    if int(balance_val) < 0:
-        await interaction.followup.send("Balance cannot be negative.", ephemeral=True)
-        return
-
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
-        await interaction.followup.send("Character not found.", ephemeral=True)
-        return
-
-    cur = await get_balance_val(ch.guild_id, ch.name)
-    await set_balance_val(ch.guild_id, ch.name, int(balance_val))
-    await ledger_write(ch.guild_id, ch.name, ch.user_id, interaction.user.id, "SET_BALANCE", int(balance_val) - cur, reason, {"set_to": int(balance_val)})
-
-    await interaction.followup.send(
-        f"Set **{ch.name}** balance: {format_money(cur)} → **{format_money(int(balance_val))}**.",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-    asyncio.create_task(rebuild_dashboard())
-
-
-# Helper: build tier choices from the NEW Asset Table catalog
-def _tier_choice_value(asset_type: str, tier_name: str) -> str:
-    return f"{asset_type}||{tier_name}"
-
-def _parse_tier_choice_value(val: str) -> tuple[str, str]:
-    if "||" not in val:
-        raise ValueError("Invalid tier selection")
-    a, t = val.split("||", 1)
-    return a.strip(), t.strip()
-
-async def tier_choice_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    q = (current or "").lower().strip()
-    out: list[app_commands.Choice[str]] = []
-    try:
-        for row in ASSET_CATALOG:
-            label = f"{row['asset_type']} — {row['tier_name']}"
-            if q and q not in label.lower():
-                continue
-            out.append(app_commands.Choice(name=label[:100], value=_tier_choice_value(row['asset_type'], row['tier_name'])[:100]))
-            if len(out) >= 25:
-                break
-        return out
-    except Exception:
-        return []
-
-def cumulative_tier_cost(asset_type: str, target_tier: int) -> int:
-    # Sum cost to acquire for tiers 1..target_tier of the given asset_type.
-    costs = [r['cost_val'] for r in ASSET_CATALOG if r['asset_type'] == asset_type and int(r['tier']) <= int(target_tier)]
-    return int(sum(costs))
-
-@tree.command(name="econ_purchase_new", description="Staff: buy a new asset for a character (tier 1..target tier cost, no negative balances).")
-@require_admin()
-@app_commands.describe(character="Character name", tier_choice="Asset Type + Tier (from NEW Asset Table)", asset_name="Custom name for this asset (unique per character)")
-@app_commands.autocomplete(character=character_name_autocomplete, tier_choice=tier_choice_autocomplete)
-async def econ_purchase_new(interaction: discord.Interaction, character: str, tier_choice: str, asset_name: str):
-    await interaction.response.defer(ephemeral=True)
-    asset_name = (asset_name or "").strip()
-    if not asset_name:
-        await interaction.followup.send("Asset name cannot be blank.", ephemeral=True)
-        return
-
-    try:
-        asset_type, tier_name = _parse_tier_choice_value(tier_choice)
-    except Exception:
-        await interaction.followup.send("Invalid tier selection.", ephemeral=True)
-        return
-
-    row = next((r for r in ASSET_CATALOG if r['asset_type'] == asset_type and r['tier_name'] == tier_name), None)
-    if not row:
-        await interaction.followup.send("That asset tier was not found in the NEW Asset Table.", ephemeral=True)
-        return
-
-    target_tier = int(row['tier'])
-    total_cost = cumulative_tier_cost(asset_type, target_tier)
-
-    async with pool.acquire() as con:
-        # Find character (legacy table) to get owner user_id
-        ch = await get_character_by_name(con, character)
-        if not ch:
-            await interaction.followup.send(f"Character not found: {character}", ephemeral=True)
-            return
-
-        owner_user_id = int(ch['user_id'])
-        # Fetch current balance
-        bal = await get_balance(con, owner_user_id, character)
-        current_val = int(bal['balance_val']) if bal else 0
-
-        if current_val < total_cost:
-            delta = total_cost - current_val
-            await interaction.followup.send(
-                f"Insufficient funds.\n"
-                f"Available: **{format_value(current_val)}**\n"
-                f"Total cost: **{format_value(total_cost)}**\n"
-                f"Shortfall: **{format_value(delta)}**",
-                ephemeral=True,
-            )
-            return
-
-        # Enforce unique asset_name per (user_id, character, asset_name)
-        exists = await con.fetchval(
-            "SELECT 1 FROM econ_assets_owned WHERE guild_id=$1 AND user_id=$2 AND character_name=$3 AND asset_name=$4",
-            LEGACY_SOURCE_GUILD_ID, owner_user_id, character, asset_name
-        )
-        if exists:
-            await interaction.followup.send(
-                "That character already has an asset with that name. Asset names must be unique per character.",
-                ephemeral=True,
-            )
-            return
-
-        # Debit and insert asset
-        new_balance = current_val - total_cost
-        await set_balance(con, owner_user_id, character, new_balance)
-
-        await con.execute(
-            """INSERT INTO econ_assets_owned
-                (guild_id, user_id, character_name, asset_name, asset_type, secondary_type, tier, tier_name, cost_val, income_val)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-            LEGACY_SOURCE_GUILD_ID, owner_user_id, character, asset_name,
-            asset_type, asset_type, target_tier, tier_name, int(row['cost_val']), int(row['income_val'])
-        )
-
-        details = {
-            "action": "purchase_new",
-            "asset_type": asset_type,
-            "tier_name": tier_name,
-            "target_tier": target_tier,
-            "total_cost": total_cost,
-            "asset_name": asset_name,
-        }
-        await log_ledger(
-            con,
-            user_id=owner_user_id,
-            character_name=character,
-            action="purchase_new",
-            delta_val=-total_cost,
-            by_user_id=int(interaction.user.id),
-            details=details,
-        )
-
-    # Refresh dashboard + confirm
-    await refresh_bank_dashboard()
-    await interaction.followup.send(
-        f"Purchased **{asset_name}** — **{asset_type} / {tier_name}** for **{format_value(total_cost)}**.\n"
-        f"New balance: **{format_value(new_balance)}**",
-        ephemeral=True,
-    )
-
-@tree.command(name="econ_refresh_bank", description="Staff: force-refresh the Bank of Vilyra dashboard.")
-@require_admin()
-async def econ_refresh_bank(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    await rebuild_dashboard()
-    await interaction.followup.send("Bank of Vilyra dashboard refreshed.", ephemeral=True)
-
-
-
-# -------------------------
-# Dashboard
-# -------------------------
-
-async def rebuild_dashboard():
-    """Rebuild the Bank of Vilyra dashboard by editing existing messages (no pings)."""
-    if not BANK_CHANNEL_ID or not BANK_MESSAGE_IDS:
-        return
-
-    guild = client.get_guild(int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0))
-    if guild is None:
-        try:
-            guild = await client.fetch_guild(int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0))
-        except Exception:
-            guild = None
-
-    bank_channel = None
-    if guild:
-        bank_channel = guild.get_channel(int(BANK_CHANNEL_ID))
-    if bank_channel is None:
-        try:
-            bank_channel = await client.fetch_channel(int(BANK_CHANNEL_ID))
-        except Exception:
-            return
-
-    # Fetch characters and balances/assets
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        chars = await con.fetch(
-            """
-            SELECT name, user_id
-            FROM characters
-            WHERE guild_id=$1 AND COALESCE(archived, FALSE)=FALSE
-            ORDER BY user_id NULLS LAST, name ASC
-            """,
-            int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0),
-        )
-
-        # balances
-        bals = await con.fetch(
-            "SELECT character_name, balance_val FROM econ_balances WHERE guild_id=$1",
-            int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0),
-        )
-        bal_map = {str(r["character_name"]): int(r["balance_val"]) for r in bals}
-
-        # assets
-        assets_rows = await con.fetch(
-            """
-            SELECT character_name, asset_name, tier_name, secondary_type
-            FROM econ_assets
-            WHERE guild_id=$1
-            ORDER BY character_name ASC, asset_name ASC
-            """,
-            int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0),
-        )
-        assets_by_char: Dict[str, List[Dict[str, str]]] = {}
-        for r in assets_rows:
-            cn = str(r["character_name"])
-            assets_by_char.setdefault(cn, []).append(
-                {
-                    "asset_name": str(r["asset_name"]),
-                    "tier_name": str(r["tier_name"]),
-                    "secondary_type": str(r["secondary_type"]),
-                }
-            )
-
-    # Resolve display names (NO mentions)
-    display_cache: Dict[Optional[int], str] = {None: "Unassigned"}
-    async def get_display_name(uid: Optional[int]) -> str:
-        if uid in display_cache:
-            return display_cache[uid]
-        if not guild or uid is None:
-            display_cache[uid] = f"User {uid}" if uid is not None else "Unassigned"
-            return display_cache[uid]
-        try:
-            member = guild.get_member(int(uid))
-            if member is None:
-                member = await guild.fetch_member(int(uid))
-            display_cache[uid] = member.display_name
-        except Exception:
-            display_cache[uid] = f"User {uid}"
-        return display_cache[uid]
-
-    # Build grouped blocks by user
-    grouped: Dict[Optional[int], List[str]] = {}
-    for row in chars:
-        name = str(row["name"])
-        uid = row["user_id"]
-        bal = bal_map.get(name, 0)
-        lines: List[str] = []
-        lines.append(f"• **{name}** — {format_money(bal)}")
-
-        arows = assets_by_char.get(name, [])
-        if arows:
-            lines.append("  *__Assets__*")
-            for a in arows[:25]:
-                # requested format: [Name] - [Tier Name]
-                lines.append(f"  {a['asset_name']} - {a['tier_name']}")
-
-        grouped.setdefault(uid, []).extend(lines)
-        grouped.setdefault(uid, []).append("")  # spacer
-
-    # Turn grouped blocks into pages
-    blocks: List[str] = []
-    for uid, lines in grouped.items():
-        disp = await get_display_name(uid)
-        header = f"__**{disp}**__"
-        body = "\n".join([ln for ln in lines if ln is not None]).rstrip()
-        blocks.append(f"{header}\n{body}".rstrip())
-
-    pages: List[str] = []
-    cur = ""
-    for b in blocks:
-        if not b.strip():
-            continue
-        if len(cur) + len(b) + 2 > 3500:
-            pages.append(cur.rstrip())
-            cur = b + "\n\n"
-        else:
-            cur += b + "\n\n"
-    if cur.strip():
-        pages.append(cur.rstrip())
-
-    # Pad/truncate to available bank message ids
-    pages = pages[: len(BANK_MESSAGE_IDS)]
-    while len(pages) < len(BANK_MESSAGE_IDS):
-        pages.append("")
-
-    # Edit each existing message
-    for i, mid in enumerate(BANK_MESSAGE_IDS):
-        content = pages[i] or " "
-        try:
-            msg = await bank_channel.fetch_message(int(mid))
-            await msg.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
-        except Exception:
-            # if we can't fetch/edit, just skip
-            continue
-
-async def on_ready():
-    try:
-        await init_db()
+        await run_db(require_character(interaction.client.db, interaction.guild.id, target.id, character_name), "require_character")
+        card = await run_db(build_character_card(interaction.client.db, interaction.guild.id, target.id, character_name), "build_character_card")
+        await safe_reply(interaction, render_character_block(card))
     except Exception as e:
-        print(f"[{VERSION}] DB init failed: {e}")
-        raise
+        LOG.exception("char_card failed")
+        await safe_reply(interaction, f"Lookup failed: {e}")
 
-    # Sync commands (guild-scoped for fast iteration)
-    if GUILD_ID:
-        guild_obj = discord.Object(id=int(GUILD_ID))
-        # IMPORTANT: When changing a command from a simple command to a Group with subcommands
-        # (like /econ_purchase -> /econ_purchase new|upgrade), Discord can keep the old shape
-        # unless we delete the guild commands first. We do a "clear + sync empty" pass, then
-        # sync the current definitions.
+
+# -----------------------------
+# Bot client
+# -----------------------------
+
+class VilyraBotClient(discord.Client):
+    def __init__(self, db: Database):
+        intents = discord.Intents.default()
+        intents.guilds = True
+        intents.members = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.db = db
+        self.dashboard_limiter = SimpleRateLimiter(DASHBOARD_EDIT_MIN_INTERVAL)
+    def _selfcheck(self) -> None:
+        """Lightweight startup audit to prevent 'orphaned' functions after edits."""
+        required_db_methods = [
+            "connect", "close", "init_schema",
+            "detect_schema",
+            "add_character", "add_ability",
+            "award_legacy", "convert_star", "spend_legacy",
+            "upgrade_ability",
+            "list_characters", "list_abilities", "list_player_ids",
+            "get_player_rank", "set_player_rank",
+            "reset_points", "reset_stars",
+            "get_dashboard_entry", "get_dashboard_message_ids",
+            "set_dashboard_message_ids", "clear_dashboard_message_ids",
+            "get_latest_player_data_updated_at",
+            "set_character_archived",
+        ]
+        missing = [m for m in required_db_methods if not hasattr(self.db, m)]
+        if missing:
+            LOG.error("SELF-CHECK FAILED: Database missing methods: %s", ", ".join(missing))
+        else:
+            LOG.info("Self-check: Database methods OK (%d checked).", len(required_db_methods))
+
+        required_commands = [
+            "set_server_rank", "add_character", "character_add", "award_legacy_points",
+            "convert_star", "reset_points", "reset_stars", "add_ability",
+            "upgrade_ability", "refresh_dashboard", "char_card",
+            "convert_points_to_stars",
+            "staff_commands",
+            "character_archive",
+            "character_archive_by_id",
+        ]
+        present = {c.name for c in self.tree.get_commands()}
+        missing_cmds = [c for c in required_commands if c not in present]
+        if missing_cmds:
+            LOG.error("SELF-CHECK FAILED: Command(s) not registered in tree: %s", ", ".join(missing_cmds))
+        else:
+            LOG.info("Self-check: Command tree OK (%d commands).", len(present))
+
+
+
+    async def setup_hook(self) -> None:
+        # Register commands
+        self.tree.add_command(set_server_rank)
+        self.tree.add_command(add_character)
+        self.tree.add_command(character_add)
+        self.tree.add_command(character_archive)
+        self.tree.add_command(character_archive_by_id)
+        self.tree.add_command(award_legacy_points)
+        self.tree.add_command(convert_star)
+        self.tree.add_command(convert_points_to_stars)
+        self.tree.add_command(staff_commands)
+        self.tree.add_command(reset_points)
+        self.tree.add_command(reset_stars)
+        self.tree.add_command(add_ability)
+        self.tree.add_command(upgrade_ability)
+        self.tree.add_command(refresh_dashboard)
+        self.tree.add_command(char_card)
+
+        LOG.info("Command tree prepared: %s command(s); GUILD_ID=%s", len(self.tree.get_commands()), os.getenv("GUILD_ID"))
+
+        self._selfcheck()
+
+        # Sync commands
         try:
-            tree.clear_commands(guild=guild_obj)
-            await tree.sync(guild=guild_obj)  # pushes an empty command set -> deletes old guild commands
-        except Exception as e:
-            print(f"[{VERSION}] Guild command clear failed (continuing): {e}")
+            gid = safe_int(os.getenv("GUILD_ID"), 0)
+            if gid:
+                self.tree.copy_global_to(guild=discord.Object(id=gid))
+                synced = await self.tree.sync(guild=discord.Object(id=gid))
+                LOG.info("Guild sync succeeded: %s commands", len(synced))
+                if len(synced)==0:
+                    LOG.warning("Guild sync returned 0 commands; attempting global sync fallback...")
+                    try:
+                        synced2 = await self.tree.sync()
+                        LOG.info("Global sync fallback succeeded: %s commands", len(synced2))
+                        try:
+                            # As a last resort, clear guild commands and re-sync to resolve "outdated" command schemas.
+                            self.tree.clear_commands(guild=discord.Object(id=gid))
+                            self.tree.copy_global_to(guild=discord.Object(id=gid))
+                            synced3 = await self.tree.sync(guild=discord.Object(id=gid))
+                            LOG.info("Guild re-sync after clear succeeded: %s commands", len(synced3))
+                        except Exception as ex3:
+                            LOG.warning("Guild re-sync after clear failed: %s", ex3)
+                    except Exception as ex2:
+                        LOG.exception("Global sync fallback failed: %s", ex2)
+                if len(synced)==0:
+                    LOG.warning("Guild sync returned 0 commands. Check GUILD_ID, bot invite scopes (applications.commands), and that commands are not pending global propagation.")
+            else:
+                synced = await self.tree.sync()
+                LOG.info("Global sync succeeded: %s commands", len(synced))
+                if len(synced)==0:
+                    LOG.warning("Global sync returned 0 commands. This can be normal if no changes were detected, but if commands are missing, check bot invite scopes and app command permissions.")
+        except Exception:
+            LOG.exception("Command sync failed")
 
-        try:
-            tree.copy_global_to(guild=guild_obj)
-            await tree.sync(guild=guild_obj)
-        except Exception as e:
-            print(f"[{VERSION}] Command sync failed: {e}")
-    else:
-        try:
-            await tree.sync()
-        except Exception as e:
-            print(f"[{VERSION}] Global command sync failed: {e}")
-
-    print(f"[test] Starting {VERSION}…")
-    print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID or 'GLOBAL'}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
-
-    asyncio.create_task(rebuild_dashboard())
+    async def on_ready(self) -> None:
+        LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
+        LOG.info("Startup dashboard refresh: beginning for %d guild(s)...", len(list(self.guilds)))
+        for g in list(self.guilds):
+            try:
+                status = await refresh_all_dashboards(self, g)
+                LOG.info("Startup dashboard refresh: %s", status)
+            except Exception:
+                LOG.exception("Startup dashboard refresh failed")
 
 
-def main():
-    client.run(DISCORD_TOKEN)
+# -----------------------------
+# Entrypoint
+# -----------------------------
+
+async def main_async() -> None:
+    token = env("DISCORD_TOKEN")
+    dsn = env("DATABASE_URL")
+
+    db = Database(dsn)
+    await db.connect()
+    await db.init_schema()
+
+    client = VilyraBotClient(db=db)
+    try:
+        await client.start(token)
+    finally:
+        await db.close()
+
+
+def main() -> None:
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
