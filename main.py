@@ -102,12 +102,12 @@ async def defer_ephemeral(interaction: discord.Interaction) -> None:
         pass
 
 
-async def safe_reply(interaction: discord.Interaction, content: str) -> None:
+async def safe_reply(interaction: discord.Interaction, content: str, *, embed: discord.Embed | None = None) -> None:
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=True)
+            await interaction.followup.send(content, ephemeral=True, embed=embed)
         else:
-            await interaction.response.send_message(content, ephemeral=True)
+            await interaction.response.send_message(content, ephemeral=True, embed=embed)
     except Exception:
         LOG.exception("Failed to send response/followup")
 
@@ -216,8 +216,8 @@ def render_reputation_block(net_lifetime: int) -> str:
 
     bar_line = "[" + "".join(bar) + "]"
 
-    left_text = "FEARED ←"
-    right_text = "→ LOVED"
+    left_text = "MALEVOLENT ←"
+    right_text = "→ BENEVOLENT"
 
     # End-align the explainer to the same visual width as the bar line.
     spaces = max(1, len(bar_line) - len(left_text) - len(right_text))
@@ -1519,7 +1519,9 @@ async def char_card(interaction: discord.Interaction, character_name: str, user:
 
         if user is not None:
             if not (isinstance(interaction.user, discord.Member) and is_staff(interaction.user)):
-                await safe_reply(interaction, "You can only look up your own characters.")
+                embed = discord.Embed()
+                embed.set_image(url='https://media.discordapp.net/attachments/1324994929176612936/1473872568191553568/1631280-doc_brown_full.jpg?ex=6997ca4b&is=699678cb&hm=fdc25510e3a9575ccf7f1cad504c577ac1d2a6b494e2810b0425c3b9211c8e7b&=&format=webp&width=869&height=856')
+                await safe_reply(interaction, "You can only look up your own characters.", embed=embed)
                 return
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, target.id, character_name), "require_character")
