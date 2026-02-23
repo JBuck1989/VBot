@@ -1,3 +1,12 @@
+# VB_v51 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# (self-check added; no destructive DB ops)
+
+from __future__ import annotations
+
+# Bump this whenever you change how dashboards/cards are rendered.
+# It forces a refresh even if player data hasn't changed (prevents "skip" from hiding template updates).
+DASHBOARD_TEMPLATE_VERSION = 2
+
 import os
 import asyncio
 import hashlib
@@ -324,7 +333,11 @@ class Database:
         # Add the columns our bot needs, in case they were missing.
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS ability_stars INT NOT NULL DEFAULT 0;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_minus INT NOT NULL DEFAULT 0;")
-        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS kingdom TEXT NOT NULL DEFAULT 'Unassigned';")
+        # Kingdom is optional; allow NULLs so you can backfill later.
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS kingdom TEXT;")
+        # If the column existed from a prior version, ensure it's nullable and has no forced default.
+        await self._execute("ALTER TABLE characters ALTER COLUMN kingdom DROP DEFAULT;")
+        await self._execute("ALTER TABLE characters ALTER COLUMN kingdom DROP NOT NULL;")
 
         # Ensure these exist too (your DB already has most of them, but safe):
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;")
@@ -394,12 +407,14 @@ class Database:
                 channel_id    BIGINT NOT NULL,
                 message_ids   TEXT,
                 content_hash  TEXT,
+                template_version INT NOT NULL DEFAULT 0,
                 updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (guild_id, user_id)
             );
             """
         )
         await self._execute("ALTER TABLE dashboard_messages ADD COLUMN IF NOT EXISTS content_hash TEXT;")
+        await self._execute("ALTER TABLE dashboard_messages ADD COLUMN IF NOT EXISTS template_version INT NOT NULL DEFAULT 0;")
         await self.detect_schema()
         LOG.info("Database schema initialized / updated")
 
@@ -842,17 +857,18 @@ class Database:
 
     # -------- Dashboard message tracking --------
 
-    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional[Any]]:
-        """Return (message_ids, content_hash, updated_at). Falls back gracefully if content_hash doesn't exist."""
+    async def get_dashboard_entry(self, guild_id: int, user_id: int) -> Tuple[List[int], Optional[str], Optional[Any], int]:
+        """Return (message_ids, content_hash, updated_at, template_version)."""
         try:
             row = await self._fetchone(
-                "SELECT message_ids, content_hash, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
+                "SELECT message_ids, content_hash, updated_at, COALESCE(template_version, 0) AS template_version FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
                 (guild_id, user_id),
             )
             ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
             h = str(row["content_hash"]) if row and row.get("content_hash") else None
             ts = row["updated_at"] if row and row.get("updated_at") else None
-            return ids, h, ts
+            tv = int(row["template_version"]) if row and row.get("template_version") is not None else 0
+            return ids, h, ts, tv
         except psycopg.errors.UndefinedColumn:
             row = await self._fetchone(
                 "SELECT message_ids, updated_at FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;",
@@ -860,10 +876,10 @@ class Database:
             )
             ids = parse_ids(row["message_ids"]) if row and row.get("message_ids") else []
             ts = row["updated_at"] if row and row.get("updated_at") else None
-            return ids, None, ts
+            return ids, None, ts, 0
 
     async def get_dashboard_message_ids(self, guild_id: int, user_id: int) -> List[int]:
-        ids, _, _ = await self.get_dashboard_entry(guild_id, user_id)
+        ids, _, _, _ = await self.get_dashboard_entry(guild_id, user_id)
         return ids
 
     async def set_dashboard_message_ids(
@@ -878,15 +894,16 @@ class Database:
         try:
             await self._execute(
                 """
-                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, updated_at)
-                VALUES (%s, %s, %s, %s, %s, NOW())
+                INSERT INTO dashboard_messages (guild_id, user_id, channel_id, message_ids, content_hash, template_version, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (guild_id, user_id)
                 DO UPDATE SET channel_id=EXCLUDED.channel_id,
                               message_ids=EXCLUDED.message_ids,
                               content_hash=EXCLUDED.content_hash,
+                              template_version=EXCLUDED.template_version,
                               updated_at=NOW();
                 """,
-                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h),
+                (guild_id, user_id, channel_id, fmt_ids(ids) if ids else None, h, DASHBOARD_TEMPLATE_VERSION),
             )
         except psycopg.errors.UndefinedColumn:
             await self._execute(
@@ -961,9 +978,12 @@ def render_character_block(card: CharacterCard) -> str:
     lines: List[str] = []
     # Keep the decorative header but bold the name and add spacing so it doesn't wrap awkwardly on mobile
     lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
-    # Kingdom (optional) directly under the character name. Omit if unknown/unassigned.
+    # Kingdom directly under the character name.
+    # Always show the line; if NULL/empty/unassigned, show a blank value (per spec).
     k = (card.kingdom or "").strip()
-    if k and k.lower() != "unassigned":
+    if (not k) or (k.lower() == "unassigned"):
+        lines.append("Kingdom:")
+    else:
         lines.append(f"Kingdom: {k}")
     lines.append("")  # spacer line between header and stats
     lines.append(f"Legacy Points: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
@@ -1038,12 +1058,13 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
             return f"Missing permissions in <#{channel.id}>: need View Channel + Send Messages."
 
     chars = await db.list_characters(guild.id, user_id)
-    stored_ids, stored_hash, dash_ts = await db.get_dashboard_entry(guild.id, user_id)
+    stored_ids, stored_hash, dash_ts, stored_tv = await db.get_dashboard_entry(guild.id, user_id)
 
     # Skip startup refresh for this player if nothing changed since last dashboard update.
     try:
         latest_ts = await db.get_latest_player_data_updated_at(guild.id, user_id)
-        if dash_ts and latest_ts and latest_ts <= dash_ts:
+        # Only skip if this dashboard was rendered with the CURRENT template.
+        if stored_tv == DASHBOARD_TEMPLATE_VERSION and dash_ts and latest_ts and latest_ts <= dash_ts:
             LOG.info(
                 "Dashboard up-to-date for user_id=%s (latest_ts=%s <= dash_ts=%s); skipping.",
                 user_id,
