@@ -5,7 +5,7 @@ from __future__ import annotations
 
 # Bump this whenever you change how dashboards/cards are rendered.
 # It forces a refresh even if player data hasn't changed (prevents "skip" from hiding template updates).
-DASHBOARD_TEMPLATE_VERSION = 2
+DASHBOARD_TEMPLATE_VERSION = 3
 
 import os
 import asyncio
@@ -439,19 +439,25 @@ class Database:
 
     # -------- Characters --------
 
-    async def add_character(self, guild_id: int, user_id: int, name: str) -> None:
+    async def add_character(self, guild_id: int, user_id: int, name: str, kingdom: str | None = None) -> None:
         name = name.strip()
         if not name:
             raise ValueError("Character name cannot be empty.")
 
+        kingdom = kingdom.strip() if isinstance(kingdom, str) else None
+        if kingdom == "":
+            kingdom = None
+
         await self._execute(
             """
-            INSERT INTO characters (guild_id, user_id, name, archived, legacy_plus, legacy_minus, lifetime_plus, lifetime_minus, influence_plus, influence_minus, ability_stars, updated_at)
-            VALUES (%s, %s, %s, FALSE, 0, 0, 0, 0, 0, 0, 0, NOW())
+            INSERT INTO characters (guild_id, user_id, name, kingdom, archived, legacy_plus, legacy_minus, lifetime_plus, lifetime_minus, influence_plus, influence_minus, ability_stars, updated_at)
+            VALUES (%s, %s, %s, %s, FALSE, 0, 0, 0, 0, 0, 0, 0, NOW())
             ON CONFLICT (guild_id, user_id, name)
-            DO UPDATE SET archived=FALSE, updated_at=NOW();
+            DO UPDATE SET archived=FALSE,
+                          kingdom=COALESCE(EXCLUDED.kingdom, characters.kingdom),
+                          updated_at=NOW();
             """,
-            (guild_id, user_id, name),
+            (guild_id, user_id, name, kingdom),
         )
 
         await self._execute(
@@ -471,6 +477,20 @@ class Database:
         """
         rowcount = await self._execute(sql, (archived, guild_id, user_id, character_name))
         return bool(rowcount and rowcount > 0)
+
+    async def delete_character(self, guild_id: int, user_id: int, character_name: str) -> bool:
+        """Hard-delete a character and its abilities. Returns True if a character row was deleted."""
+        # Delete abilities first (if any)
+        await self._execute(
+            "DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND character_name=%s;",
+            (guild_id, user_id, character_name),
+        )
+        rowcount = await self._execute(
+            "DELETE FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s;",
+            (guild_id, user_id, character_name),
+        )
+        return bool(rowcount and rowcount > 0)
+
 
     async def set_character_kingdom(self, guild_id: int, user_id: int, character_name: str, kingdom: str) -> bool:
         """Set a character's home kingdom. Returns True if updated."""
@@ -1228,12 +1248,19 @@ async def set_char_kingdom(
 @app_commands.command(name="add_character", description="(Staff) Add a character under a player.")
 @in_guild_only()
 @staff_only()
-async def add_character(interaction: discord.Interaction, user: discord.Member, character_name: str):
+async def add_character(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: str | None = None):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        await run_db(interaction.client.db.add_character(interaction.guild.id, user.id, character_name), "add_character")
-        await log_to_channel(interaction.guild, f"➕ {interaction.user.mention} added character **{character_name.strip()}** under {user.mention}")
+        await run_db(
+            interaction.client.db.add_character(interaction.guild.id, user.id, character_name, kingdom),
+            "add_character",
+        )
+        k_txt = f" (Kingdom: **{kingdom}**)" if kingdom else ""
+        await log_to_channel(
+            interaction.guild,
+            f"➕ {interaction.user.mention} added character **{character_name.strip()}** under {user.mention}{k_txt}",
+        )
         status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
         await safe_reply(interaction, "Character added. " + status)
     except Exception as e:
@@ -1241,18 +1268,20 @@ async def add_character(interaction: discord.Interaction, user: discord.Member, 
         await safe_reply(interaction, f"Add character failed: {e}")
 
 
-@app_commands.command(name="character_add", description="(Staff) Alias for /add_character (compatibility).")
+@app_commands.command(name="character_add", description="(Staff) Add a character for a user.")
 @in_guild_only()
 @staff_only()
-async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str):
-    await add_character(interaction, user, character_name)
+@app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
+async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: app_commands.Choice[str]):
+    await add_character(interaction, user, character_name, kingdom.value)
 
 
 @app_commands.command(name="character_create", description="(Staff) Create a character for a player.")
 @in_guild_only()
 @staff_only()
-async def character_create(interaction: discord.Interaction, user: discord.Member, character_name: str):
-    await add_character(interaction, user, character_name)
+@app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
+async def character_create(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: app_commands.Choice[str]):
+    await add_character(interaction, user, character_name, kingdom.value)
 
 
 
@@ -1294,6 +1323,34 @@ async def character_archive(
     await interaction.followup.send(f"✅ {verb.title()} **{character_name}**. {status}", ephemeral=True)
 
 
+
+
+
+
+@app_commands.command(name="character_delete", description="(Staff) Delete a character (cannot be undone).")
+@in_guild_only()
+@staff_only()
+async def character_delete(interaction: discord.Interaction, user: discord.Member, character_name: str):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        ok = await run_db(
+            interaction.client.db.delete_character(interaction.guild.id, user.id, character_name),
+            "delete_character",
+        )
+        if not ok:
+            await safe_reply(interaction, f"Character not found: **{character_name}**")
+            return
+
+        await log_to_channel(
+            interaction.guild,
+            f"🗑️ {interaction.user.mention} deleted character **{character_name.strip()}** for {user.mention}",
+        )
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Character deleted. " + status)
+    except Exception as e:
+        LOG.exception("character_delete failed")
+        await safe_reply(interaction, f"Delete character failed: {e}")
 
 
 @app_commands.command(name="character_archive_by_id", description="(Staff) Archive/unarchive a character by user ID (use for players who left).")
@@ -1691,9 +1748,11 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(set_server_rank)
         self.tree.add_command(set_char_kingdom)
         self.tree.add_command(add_character)
+        self.tree.add_command(character_create)
         self.tree.add_command(character_add)
         self.tree.add_command(character_archive)
         self.tree.add_command(character_archive_by_id)
+        self.tree.add_command(character_delete)
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
         self.tree.add_command(convert_points_to_stars)
