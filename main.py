@@ -1245,27 +1245,22 @@ async def set_char_kingdom(
         await safe_reply(interaction, f"Set kingdom failed: {e}")
 
 
-@app_commands.command(name="add_character", description="(Staff) Add a character under a player.")
-@in_guild_only()
-@staff_only()
-async def add_character(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: str | None = None):
+async def _add_character_impl(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: Optional[str]) -> None:
+    """Internal helper used by staff commands to add a character."""
     await defer_ephemeral(interaction)
+
+    kingdom_value = (kingdom or None)
+
     try:
-        assert interaction.guild is not None
-        await run_db(
-            interaction.client.db.add_character(interaction.guild.id, user.id, character_name, kingdom),
-            "add_character",
-        )
-        k_txt = f" (Kingdom: **{kingdom}**)" if kingdom else ""
-        await log_to_channel(
-            interaction.guild,
-            f"➕ {interaction.user.mention} added character **{character_name.strip()}** under {user.mention}{k_txt}",
-        )
-        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-        await safe_reply(interaction, "Character added. " + status)
+        await run_db(db.add_character(interaction.guild.id, user.id, character_name, kingdom_value), "add_character")
     except Exception as e:
-        LOG.exception("add_character failed")
-        await safe_reply(interaction, f"Add character failed: {e}")
+        await interaction.followup.send(f"Add character failed: {e}", ephemeral=True)
+        return
+
+    await log_command(interaction, f"➕ {interaction.user.mention} added **{character_name}** for {user.mention} (kingdom: {kingdom_value or '—'}).")
+    await refresh_player_dashboard(interaction.client, interaction.guild, user.id, force=True)
+
+    await interaction.followup.send(f"Character **{character_name}** added for {user.mention}. Dashboard updated.", ephemeral=True)
 
 
 @app_commands.command(name="character_add", description="(Staff) Add a character for a user.")
@@ -1273,15 +1268,8 @@ async def add_character(interaction: discord.Interaction, user: discord.Member, 
 @staff_only()
 @app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
 async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: app_commands.Choice[str]):
-    await add_character(interaction, user, character_name, kingdom.value)
+    await _add_character_impl(interaction, user, character_name, kingdom.value)
 
-
-@app_commands.command(name="character_create", description="(Staff) Create a character for a player.")
-@in_guild_only()
-@staff_only()
-@app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
-async def character_create(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: app_commands.Choice[str]):
-    await add_character(interaction, user, character_name, kingdom.value)
 
 
 
@@ -1747,8 +1735,6 @@ class VilyraBotClient(discord.Client):
         # Register commands
         self.tree.add_command(set_server_rank)
         self.tree.add_command(set_char_kingdom)
-        self.tree.add_command(add_character)
-        self.tree.add_command(character_create)
         self.tree.add_command(character_add)
         self.tree.add_command(character_archive)
         self.tree.add_command(character_archive_by_id)
