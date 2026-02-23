@@ -1,3 +1,12 @@
+# VB_v51 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# (self-check added; no destructive DB ops)
+
+from __future__ import annotations
+
+# Bump this whenever you change how dashboards/cards are rendered.
+# It forces a refresh even if player data hasn't changed (prevents "skip" from hiding template updates).
+DASHBOARD_TEMPLATE_VERSION = 2
+
 import os
 import asyncio
 import hashlib
@@ -969,8 +978,6 @@ def render_character_block(card: CharacterCard) -> str:
     lines: List[str] = []
     # Keep the decorative header but bold the name and add spacing so it doesn't wrap awkwardly on mobile
     lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
-    # Spacer line between the character header and the character details (per formatting spec)
-    lines.append("")
     # Kingdom directly under the character name.
     # Always show the line; if NULL/empty/unassigned, show a blank value (per spec).
     k = (card.kingdom or "").strip()
@@ -978,6 +985,7 @@ def render_character_block(card: CharacterCard) -> str:
         lines.append("Kingdom:")
     else:
         lines.append(f"Kingdom: {k}")
+    lines.append("")  # spacer line between header and stats
     lines.append(f"Legacy Points: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
     lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
     lines.append("Influence Stars: " + render_influence_star_bar(card.infl_minus, card.infl_plus))
