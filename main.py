@@ -47,6 +47,9 @@ SERVER_RANKS = [
     "Sovereign",
 ]
 
+KINGDOMS = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
+
+
 BORDER_LEN = 20
 PLAYER_BORDER = "═" * BORDER_LEN
 CHAR_SEPARATOR = "-" * BORDER_LEN
@@ -95,12 +98,12 @@ def is_staff(member: discord.abc.User | discord.Member) -> bool:
 
 
 async def defer_ephemeral(interaction: discord.Interaction) -> None:
+    """Defer an interaction ephemerally (safe no-op if already responded)."""
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception:
         pass
-
 
 async def safe_reply(interaction: discord.Interaction, content: str, *, embed: discord.Embed | None = None) -> None:
     try:
@@ -260,10 +263,11 @@ class Database:
             raise RuntimeError("Database not connected")
         return self._conn
 
-    async def _execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+    async def _execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         conn = self._require_conn()
         async with conn.cursor() as cur:
             await cur.execute(sql, params)
+            return int(cur.rowcount or 0)
 
     async def _fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
         conn = self._require_conn()
@@ -320,6 +324,7 @@ class Database:
         # Add the columns our bot needs, in case they were missing.
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS ability_stars INT NOT NULL DEFAULT 0;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS influence_minus INT NOT NULL DEFAULT 0;")
+        await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS kingdom TEXT NOT NULL DEFAULT 'Unassigned';")
 
         # Ensure these exist too (your DB already has most of them, but safe):
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;")
@@ -451,6 +456,21 @@ class Database:
         """
         rowcount = await self._execute(sql, (archived, guild_id, user_id, character_name))
         return bool(rowcount and rowcount > 0)
+
+    async def set_character_kingdom(self, guild_id: int, user_id: int, character_name: str, kingdom: str) -> bool:
+        """Set a character's home kingdom. Returns True if updated."""
+        sql = """
+            UPDATE characters
+               SET kingdom=%s,
+                   updated_at=NOW()
+             WHERE guild_id=%s
+               AND user_id=%s
+               AND name=%s;
+        """
+        rowcount = await self._execute(sql, (kingdom, guild_id, user_id, character_name))
+        return rowcount > 0
+
+
     async def character_exists(self, guild_id: int, user_id: int, name: str) -> bool:
         row = await self._fetchone(
             "SELECT 1 FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s AND COALESCE(archived, FALSE)=FALSE LIMIT 1;",
@@ -482,11 +502,11 @@ class Database:
         )
         return [int(r["user_id"]) for r in rows if r and r.get("user_id") is not None]
 
-    async def get_character_state(self, guild_id: int, user_id: int, name: str) -> Dict[str, int]:
+    async def get_character_state(self, guild_id: int, user_id: int, name: str) -> Dict[str, Any]:
         row = await self._fetchone(
             """
             SELECT legacy_plus, legacy_minus, lifetime_plus, lifetime_minus,
-                   influence_plus, influence_minus, ability_stars
+                   influence_plus, influence_minus, ability_stars, kingdom
             FROM characters
             WHERE guild_id=%s AND user_id=%s AND name=%s AND COALESCE(archived, FALSE)=FALSE
             LIMIT 1;
@@ -503,6 +523,7 @@ class Database:
             "influence_plus": safe_int(row.get("influence_plus"), 0),
             "influence_minus": safe_int(row.get("influence_minus"), 0),
             "ability_stars": safe_int(row.get("ability_stars"), 0),
+            "kingdom": (row.get("kingdom") or ""),
         }
 
     async def award_legacy(self, guild_id: int, user_id: int, name: str, pos: int = 0, neg: int = 0) -> None:
@@ -907,6 +928,7 @@ class Database:
 @dataclass
 class CharacterCard:
     name: str
+    kingdom: str
     legacy_plus: int
     legacy_minus: int
     lifetime_plus: int
@@ -922,6 +944,7 @@ async def build_character_card(db: Database, guild_id: int, user_id: int, name: 
     abilities = await db.list_abilities(guild_id, user_id, name)
     return CharacterCard(
         name=name,
+        kingdom=st.get("kingdom", "Unassigned"),
         legacy_plus=st["legacy_plus"],
         legacy_minus=st["legacy_minus"],
         lifetime_plus=st["lifetime_plus"],
@@ -938,6 +961,10 @@ def render_character_block(card: CharacterCard) -> str:
     lines: List[str] = []
     # Keep the decorative header but bold the name and add spacing so it doesn't wrap awkwardly on mobile
     lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
+    # Kingdom (optional) directly under the character name. Omit if unknown/unassigned.
+    k = (card.kingdom or "").strip()
+    if k and k.lower() != "unassigned":
+        lines.append(f"Kingdom: {k}")
     lines.append("")  # spacer line between header and stats
     lines.append(f"Legacy Points: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
     lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
@@ -1136,6 +1163,47 @@ async def set_server_rank(interaction: discord.Interaction, user: discord.Member
         await safe_reply(interaction, f"Set rank failed: {e}")
 
 
+@app_commands.command(name="set_char_kingdom", description="(Staff) Set a character's home kingdom.")
+@in_guild_only()
+@staff_only()
+@app_commands.describe(user="The player who owns the character", character_name="Exact character name", kingdom="New home kingdom")
+@app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
+async def set_char_kingdom(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    kingdom: app_commands.Choice[str],
+):
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        char_name = character_name.strip()
+        if not char_name:
+            await safe_reply(interaction, "Character name is required.")
+            return
+        # Ensure the character exists for this user
+        exists = await run_db(
+            interaction.client.db.character_exists(interaction.guild.id, user.id, char_name),
+            "character_exists"
+        )
+        if not exists:
+            await safe_reply(interaction, f"Character not found for {user.mention}: **{char_name}**")
+            return
+        await run_db(
+            interaction.client.db.set_character_kingdom(interaction.guild.id, user.id, char_name, kingdom.value),
+            "set_character_kingdom"
+        )
+        await log_to_channel(
+            interaction.guild,
+            f"🏰 {interaction.user.mention} set kingdom for **{char_name}** ({user.mention}) to **{kingdom.value}**"
+        )
+        status = await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+        await safe_reply(interaction, "Kingdom updated. " + status)
+    except Exception as e:
+        LOG.exception("set_char_kingdom failed")
+        await safe_reply(interaction, f"Set kingdom failed: {e}")
+
+
 @app_commands.command(name="add_character", description="(Staff) Add a character under a player.")
 @in_guild_only()
 @staff_only()
@@ -1159,6 +1227,14 @@ async def character_add(interaction: discord.Interaction, user: discord.Member, 
     await add_character(interaction, user, character_name)
 
 
+@app_commands.command(name="character_create", description="(Staff) Create a character for a player.")
+@in_guild_only()
+@staff_only()
+async def character_create(interaction: discord.Interaction, user: discord.Member, character_name: str):
+    await add_character(interaction, user, character_name)
+
+
+
 @app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character (hide/show on dashboard).")
 @app_commands.guild_only()
 @staff_only()
@@ -1180,6 +1256,7 @@ async def character_archive(
     ok = await run_db(
         interaction.client.db.set_character_archived(interaction.guild.id, user.id, character_name, do_archive),
         "set_character_archived",
+            "set_character_kingdom",
     )
     if not ok:
         await interaction.followup.send(f"Character not found: **{character_name}**", ephemeral=True)
@@ -1577,6 +1654,7 @@ class VilyraBotClient(discord.Client):
             "staff_commands",
             "character_archive",
             "character_archive_by_id",
+            "set_char_kingdom",
         ]
         present = {c.name for c in self.tree.get_commands()}
         missing_cmds = [c for c in required_commands if c not in present]
@@ -1590,6 +1668,7 @@ class VilyraBotClient(discord.Client):
     async def setup_hook(self) -> None:
         # Register commands
         self.tree.add_command(set_server_rank)
+        self.tree.add_command(set_char_kingdom)
         self.tree.add_command(add_character)
         self.tree.add_command(character_add)
         self.tree.add_command(character_archive)
