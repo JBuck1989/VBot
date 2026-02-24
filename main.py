@@ -1171,16 +1171,25 @@ def staff_only(func=None):
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
             return False
+
+        # Ensure we have a discord.Member (Interaction.user can be a User in some contexts)
         member = interaction.guild.get_member(interaction.user.id)
         if member is None:
-            # Fallback (shouldn't happen for guild_only commands)
-            member = interaction.user
+            try:
+                member = await interaction.guild.fetch_member(interaction.user.id)
+            except Exception:
+                member = None
+
+        if member is None:
+            return False
+
         return is_staff(member)
 
-    check = app_commands.check(predicate)
+    deco = app_commands.check(predicate)
     if func is None:
-        return check
-    return check(func)
+        return deco
+    return deco(func)
+
 
 def in_guild_only():
     async def predicate(interaction: discord.Interaction) -> bool:
