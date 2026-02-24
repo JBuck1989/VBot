@@ -58,19 +58,16 @@ SERVER_RANKS = [
 ]
 
 
-# Kingdom dropdown options for character creation/moves
-Kingdom = Literal["Velarith", "Lyvik", "Baelon", "Sethrathiel", "Avalea"]
-KINGDOMS = ["Velarith", "Lyvik", "Baelon", "Sethrathiel", "Avalea"]
+"""Kingdom options.
 
-class Kingdom(str, Enum):
-    VELARITH = "Velarith"
-    LYVIK = "Lyvik"
-    BAELON = "Baelon"
-    SETHRATHIEL = "Sethrathiel"
-    AVALEA = "Avalea"
+We use app_commands.choices with a plain `str` parameter so Discord renders this
+as a required dropdown, and discord.py passes us the selected string value.
+"""
 
-
-KINGDOMS = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
+KINGDOMS: List[str] = ["Velarith", "Lyvik", "Baelon", "Sethrathiel", "Avalea"]
+KINGDOM_CHOICES: List[app_commands.Choice[str]] = [
+    app_commands.Choice(name=k, value=k) for k in KINGDOMS
+]
 
 
 BORDER_LEN = 20
@@ -1170,26 +1167,21 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
 # -----------------------------
 
 def staff_only(func=None):
-    """Decorator/check that restricts a slash-command to staff members.
-
-    Supports both usages:
-      @staff_only
-      @staff_only()
-    """
+    """Decorator/check: allow only users with Guardian/Warden roles."""
     async def predicate(interaction: discord.Interaction) -> bool:
-        return await is_staff(interaction)
+        if interaction.guild is None:
+            return False
+        member = interaction.guild.get_member(interaction.user.id)
+        if member is None:
+            # Fallback (shouldn't happen for guild_only commands)
+            member = interaction.user
+        return is_staff(member)
 
     check = app_commands.check(predicate)
-
-    # Used as @staff_only()
     if func is None:
         return check
-
-    # Used as @staff_only
     return check(func)
 
-    # Used as @staff_only
-    return check(func)
 def in_guild_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -1273,7 +1265,7 @@ async def _add_character_impl(
     interaction: discord.Interaction,
     user: discord.Member,
     character_name: str,
-    kingdom: Kingdom,
+    kingdom_value: str,
 ) -> None:
     """Shared implementation for add-character commands."""
     db: Database = interaction.client.db  # type: ignore[attr-defined]
@@ -1295,7 +1287,7 @@ async def _add_character_impl(
                 guild_id=interaction.guild.id,
                 user_id=user.id,
                 name=character_name,
-                kingdom=kingdom.value,
+                kingdom=kingdom_value,
             ),
             "add_character",
         )
@@ -1314,7 +1306,7 @@ async def _add_character_impl(
         logger.exception("Dashboard update failed after add_character")
 
     await interaction.followup.send(
-        f"✅ Added **{character_name}** for {user.mention} (Kingdom: **{kingdom.value}**).",
+        f"✅ Added **{character_name}** for {user.mention} (Kingdom: **{kingdom_value}**).",
         ephemeral=True,
     )
 
@@ -1341,9 +1333,7 @@ async def add_character(
 @app_commands.guild_only()
 @staff_only
 @app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character (hide/show on dashboard).")
-@app_commands.guild_only()
-@staff_only()
-@app_commands.describe(user="Player who owns the character", character_name="Character to archive/unarchive")
+@app_commands.describe(user="Player who owns the character", character_name="Character to archive/unarchive", action="Archive or unarchive")
 @app_commands.choices(action=[
     app_commands.Choice(name="Archive", value="archive"),
     app_commands.Choice(name="Unarchive", value="unarchive"),
@@ -1361,7 +1351,6 @@ async def character_archive(
     ok = await run_db(
         interaction.client.db.set_character_archived(interaction.guild.id, user.id, character_name, do_archive),
         "set_character_archived",
-            "set_character_kingdom",
     )
     if not ok:
         await interaction.followup.send(f"Character not found: **{character_name}**", ephemeral=True)
