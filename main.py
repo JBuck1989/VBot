@@ -117,6 +117,20 @@ def is_staff(member: discord.abc.User | discord.Member) -> bool:
     return False
 
 
+async def staff_check(interaction: discord.Interaction) -> bool:
+    """app_commands check predicate (must be async-safe)."""
+    if interaction.guild is None:
+        return False
+    member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    if member is None:
+        return False
+    return is_staff(member)
+
+
+# Decorator to use as "@staff_only" (NO parentheses)
+staff_only = app_commands.check(staff_check)
+
+
 async def defer_ephemeral(interaction: discord.Interaction) -> None:
     """Defer an interaction ephemerally (safe no-op if already responded)."""
     try:
@@ -1166,31 +1180,6 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
 # Command guards
 # -----------------------------
 
-def staff_only(func=None):
-    """Decorator/check: allow only users with Guardian/Warden roles."""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            return False
-
-        # Ensure we have a discord.Member (Interaction.user can be a User in some contexts)
-        member = interaction.guild.get_member(interaction.user.id)
-        if member is None:
-            try:
-                member = await interaction.guild.fetch_member(interaction.user.id)
-            except Exception:
-                member = None
-
-        if member is None:
-            return False
-
-        return is_staff(member)
-
-    deco = app_commands.check(predicate)
-    if func is None:
-        return deco
-    return deco(func)
-
-
 def in_guild_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -1211,7 +1200,7 @@ async def require_character(db: Database, guild_id: int, user_id: int, name: str
 
 @app_commands.command(name="set_server_rank", description="(Staff) Set a player's server rank.")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def set_server_rank(interaction: discord.Interaction, user: discord.Member, rank: str):
     await defer_ephemeral(interaction)
     try:
@@ -1231,7 +1220,7 @@ async def set_server_rank(interaction: discord.Interaction, user: discord.Member
 
 @app_commands.command(name="set_char_kingdom", description="(Staff) Set a character's home kingdom.")
 @in_guild_only()
-@staff_only()
+@staff_only
 @app_commands.describe(user="The player who owns the character", character_name="Exact character name", kingdom="New home kingdom")
 @app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
 async def set_char_kingdom(
@@ -1382,7 +1371,7 @@ async def character_archive(
 
 @app_commands.command(name="character_delete", description="(Staff) Delete a character (cannot be undone).")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def character_delete(interaction: discord.Interaction, user: discord.Member, character_name: str):
     await defer_ephemeral(interaction)
     try:
@@ -1408,7 +1397,7 @@ async def character_delete(interaction: discord.Interaction, user: discord.Membe
 
 @app_commands.command(name="character_archive_by_id", description="(Staff) Archive/unarchive a character by user ID (use for players who left).")
 @in_guild_only()
-@staff_only()
+@staff_only
 @app_commands.describe(
     user_id="Discord user ID of the player (numbers only).",
     character_name="Exact character name to archive/unarchive.",
@@ -1463,7 +1452,7 @@ async def character_archive_by_id(
 
 @app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def award_legacy_points(interaction: discord.Interaction, user: discord.Member, character_name: str, positive: int = 0, negative: int = 0):
     await defer_ephemeral(interaction)
     try:
@@ -1535,7 +1524,7 @@ async def _handle_convert_star_interaction(
     app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
 ])
 @in_guild_only()
-@staff_only()
+@staff_only
 async def convert_star(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1554,7 +1543,7 @@ async def convert_star(
     app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
 ])
 @in_guild_only()
-@staff_only()
+@staff_only
 async def convert_points_to_stars(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1568,7 +1557,7 @@ async def convert_points_to_stars(
 
 @app_commands.command(name="staff_commands", description="(Staff) Show a quick list of staff commands and what they do.")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def staff_commands(interaction: discord.Interaction):
     """Ephemeral staff help: lists core staff/admin actions (no legacy/internal/debug commands)."""
     await defer_ephemeral(interaction)
@@ -1594,7 +1583,7 @@ async def staff_commands(interaction: discord.Interaction):
 
 @app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character (use for corrections).")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def reset_points(interaction: discord.Interaction, user: discord.Member, character_name: str,
                        legacy_plus: Optional[int] = None, legacy_minus: Optional[int] = None,
                        lifetime_plus: Optional[int] = None, lifetime_minus: Optional[int] = None):
@@ -1614,7 +1603,7 @@ async def reset_points(interaction: discord.Interaction, user: discord.Member, c
 
 @app_commands.command(name="reset_stars", description="(Staff) Set ability stars and/or influence stars for a character.")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def reset_stars(interaction: discord.Interaction, user: discord.Member, character_name: str,
                       ability_stars: Optional[int] = None, influence_plus: Optional[int] = None, influence_minus: Optional[int] = None):
     await defer_ephemeral(interaction)
@@ -1633,7 +1622,7 @@ async def reset_stars(interaction: discord.Interaction, user: discord.Member, ch
 
 @app_commands.command(name="add_ability", description="(Staff) Add an ability to a character (capacity = 2 + ability stars).")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def add_ability(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_name: str):
     await defer_ephemeral(interaction)
     try:
@@ -1653,7 +1642,7 @@ async def add_ability(interaction: discord.Interaction, user: discord.Member, ch
 
 @app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points per upgrade (max 5 upgrades per ability). Requires explicit +/− split.")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def upgrade_ability(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1703,7 +1692,7 @@ async def upgrade_ability(
 
 @app_commands.command(name="refresh_dashboard", description="(Staff) Force refresh the whole dashboard.")
 @in_guild_only()
-@staff_only()
+@staff_only
 async def refresh_dashboard(interaction: discord.Interaction):
     await defer_ephemeral(interaction)
     try:
@@ -1824,12 +1813,7 @@ class VilyraBotClient(discord.Client):
             if gid:
                 guild_obj = discord.Object(id=gid)
 
-                # IMPORTANT: Clear + resync to prevent Discord-side signature mismatches from older deployments.
-                # This is safe because we always re-upload the current command set immediately after clearing.
-                self.tree.clear_commands(guild=guild_obj)
-                await self.tree.sync(guild=guild_obj)
-
-                self.tree.copy_global_to(guild=guild_obj)
+                # Fast guild sync (final authoritative wipe+sync happens in on_ready)
                 synced = await self.tree.sync(guild=guild_obj)
                 LOG.info("Guild sync succeeded: %s commands", len(synced))
 
@@ -1860,6 +1844,20 @@ class VilyraBotClient(discord.Client):
 
     async def on_ready(self) -> None:
         LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
+
+        # One-time hard reset of guild commands to eliminate Discord-side signature mismatches.
+        # This fixes cases where Discord still has an older schema and interactions fail with CommandSignatureMismatch.
+        if not getattr(self, "_did_hard_sync", False):
+            try:
+                gid = safe_int(os.getenv("GUILD_ID"), 0)
+                if gid and getattr(self, "application_id", None):
+                    await self.http.bulk_upsert_guild_commands(self.application_id, gid, [])
+                    synced = await self.tree.sync(guild=discord.Object(id=gid))
+                    LOG.info("Hard guild command sync complete: %s commands", len(synced))
+            except Exception:
+                LOG.exception("Hard guild command sync failed")
+            self._did_hard_sync = True
+
         LOG.info("Startup dashboard refresh: beginning for %d guild(s)...", len(list(self.guilds)))
         for g in list(self.guilds):
             try:
