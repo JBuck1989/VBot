@@ -13,6 +13,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Literal
+from enum import Enum
 
 import discord
 from discord import app_commands
@@ -55,6 +56,14 @@ SERVER_RANKS = [
     "Legend",
     "Sovereign",
 ]
+
+class Kingdom(str, Enum):
+    VELARITH = "Velarith"
+    LYVIK = "Lyvik"
+    BAELON = "Baelon"
+    SETHRATHIEL = "Sethrathiel"
+    AVALEA = "Avalea"
+
 
 KINGDOMS = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
 
@@ -1245,73 +1254,80 @@ async def set_char_kingdom(
         await safe_reply(interaction, f"Set kingdom failed: {e}")
 
 
-async def _add_character_impl(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: Optional[str]) -> None:
-    """Core implementation for /add_character."""
+async def _add_character_impl(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    kingdom: Kingdom,
+) -> None:
+    """Shared implementation for add-character commands."""
+    db: Database = interaction.client.db  # type: ignore[attr-defined]
+
     await defer_ephemeral(interaction)
 
-    try:
-        assert_staff(interaction)
-        # Normalize inputs
-        cname = (character_name or "").strip()
-        if not cname:
-            raise ValueError("Character name is required.")
-
-        k = (kingdom or "").strip() or None
-
-        db: Database = interaction.client.db  # type: ignore[attr-defined]
-        await run_db(db.add_character(interaction.guild.id, user.id, cname, k), "add_character")
-
-        await interaction.followup.send(f"✅ Added **{cname}** for {user.mention}.", ephemeral=True)
-
-        # Ensure dashboard reflects the new character immediately
-        await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
-
-        await log_command(
-            interaction.client,
-            interaction.guild,
-            f"➕ {interaction.user.mention} added character **{cname}** for {user.mention}" + (f" (kingdom: **{k}**)." if k else "."),
-        )
-    except Exception as e:
-        await interaction.followup.send(f"❌ Add character failed: {e}", ephemeral=True)
-
-
-
-    kingdom_value = (kingdom or None)
-
-    try:
-        await run_db(db.add_character(interaction.guild.id, user.id, character_name, kingdom_value), "add_character")
-    except Exception as e:
-        await interaction.followup.send(f"Add character failed: {e}", ephemeral=True)
+    # Basic validation
+    character_name = (character_name or "").strip()
+    if not character_name:
+        await interaction.followup.send("❌ Character name cannot be blank.", ephemeral=True)
+        return
+    if len(character_name) > 80:
+        await interaction.followup.send("❌ Character name is too long (max 80 characters).", ephemeral=True)
         return
 
-    await log_command(interaction, f"➕ {interaction.user.mention} added **{character_name}** for {user.mention} (kingdom: {kingdom_value or '—'}).")
-    await refresh_player_dashboard(interaction.client, interaction.guild, user.id, force=True)
+    try:
+        await run_db(
+            db.add_character(
+                guild_id=interaction.guild.id,
+                user_id=user.id,
+                name=character_name,
+                kingdom=kingdom.value,
+            ),
+            "add_character",
+        )
+    except ValueError as e:
+        await interaction.followup.send(f"❌ Add character failed: {e}", ephemeral=True)
+        return
+    except Exception:
+        logger.exception("add_character failed")
+        await interaction.followup.send("❌ Add character failed due to an unexpected error.", ephemeral=True)
+        return
 
-    await interaction.followup.send(f"Character **{character_name}** added for {user.mention}. Dashboard updated.", ephemeral=True)
+    # Update dashboard + confirm
+    try:
+        await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+    except Exception:
+        logger.exception("Dashboard update failed after add_character")
+
+    await interaction.followup.send(
+        f"✅ Added **{character_name}** for {user.mention} (Kingdom: **{kingdom.value}**).",
+        ephemeral=True,
+    )
 
 
-@app_commands.command(name="add_character", description="Add a character for a player (staff only).")
-@app_commands.describe(
-    user="The player who will own this character",
-    character_name="Character name (exact)",
-    kingdom="Starting kingdom (optional)",
-)
-@app_commands.choices(
-    kingdom=[
-        app_commands.Choice(name="Velarith", value="Velarith"),
-        app_commands.Choice(name="Lyvik", value="Lyvik"),
-        app_commands.Choice(name="Baelon", value="Baelon"),
-        app_commands.Choice(name="Sethrathiel", value="Sethrathiel"),
-        app_commands.Choice(name="Avalea", value="Avalea"),
-    ]
-)
+@app_commands.guild_only()
+@staff_only
+@app_commands.command(name="add_character", description="Add a character for a user.")
+@app_commands.describe(user="The player", character_name="The character's name", kingdom="The character's kingdom")
 async def add_character(
     interaction: discord.Interaction,
     user: discord.Member,
     character_name: str,
-    kingdom: Optional[app_commands.Choice[str]] = None,
-) -> None:
-    await _add_character_impl(interaction, user, character_name, kingdom.value if kingdom else None)
+    kingdom: Kingdom,
+):
+    await _add_character_impl(interaction, user, character_name, kingdom)
+
+@app_commands.guild_only()
+@staff_only
+@app_commands.command(name="character_add", description="Add a character for a user.")
+@app_commands.describe(user="The player", character_name="The character's name", kingdom="The character's kingdom")
+async def character_add(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    kingdom: Kingdom,
+):
+    await _add_character_impl(interaction, user, character_name, kingdom)
+
 
 
 
@@ -1757,7 +1773,7 @@ class VilyraBotClient(discord.Client):
             LOG.info("Self-check: Database methods OK (%d checked).", len(required_db_methods))
 
         required_commands = [
-            "set_server_rank", "add_character", "award_legacy_points",
+            "set_server_rank", "add_character", "character_add", "award_legacy_points",
             "convert_star", "reset_points", "reset_stars", "add_ability",
             "upgrade_ability", "refresh_dashboard", "char_card",
             "convert_points_to_stars",
@@ -1780,6 +1796,7 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(set_server_rank)
         self.tree.add_command(set_char_kingdom)
         self.tree.add_command(add_character)
+        self.tree.add_command(character_add)
         self.tree.add_command(character_archive)
         self.tree.add_command(character_archive_by_id)
         self.tree.add_command(character_delete)
