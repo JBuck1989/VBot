@@ -1246,8 +1246,35 @@ async def set_char_kingdom(
 
 
 async def _add_character_impl(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: Optional[str]) -> None:
-    """Internal helper used by staff commands to add a character."""
+    """Core implementation for /add_character."""
     await defer_ephemeral(interaction)
+
+    try:
+        assert_staff(interaction)
+        # Normalize inputs
+        cname = (character_name or "").strip()
+        if not cname:
+            raise ValueError("Character name is required.")
+
+        k = (kingdom or "").strip() or None
+
+        db: Database = interaction.client.db  # type: ignore[attr-defined]
+        await run_db(db.add_character(interaction.guild.id, user.id, cname, k), "add_character")
+
+        await interaction.followup.send(f"✅ Added **{cname}** for {user.mention}.", ephemeral=True)
+
+        # Ensure dashboard reflects the new character immediately
+        await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
+
+        await log_command(
+            interaction.client,
+            interaction.guild,
+            f"➕ {interaction.user.mention} added character **{cname}** for {user.mention}" + (f" (kingdom: **{k}**)." if k else "."),
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Add character failed: {e}", ephemeral=True)
+
+
 
     kingdom_value = (kingdom or None)
 
@@ -1263,12 +1290,29 @@ async def _add_character_impl(interaction: discord.Interaction, user: discord.Me
     await interaction.followup.send(f"Character **{character_name}** added for {user.mention}. Dashboard updated.", ephemeral=True)
 
 
-@app_commands.command(name="character_add", description="(Staff) Add a character for a user.")
-@in_guild_only()
-@staff_only()
-@app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
-async def character_add(interaction: discord.Interaction, user: discord.Member, character_name: str, kingdom: app_commands.Choice[str]):
-    await _add_character_impl(interaction, user, character_name, kingdom.value)
+@app_commands.command(name="add_character", description="Add a character for a player (staff only).")
+@app_commands.describe(
+    user="The player who will own this character",
+    character_name="Character name (exact)",
+    kingdom="Starting kingdom (optional)",
+)
+@app_commands.choices(
+    kingdom=[
+        app_commands.Choice(name="Velarith", value="Velarith"),
+        app_commands.Choice(name="Lyvik", value="Lyvik"),
+        app_commands.Choice(name="Baelon", value="Baelon"),
+        app_commands.Choice(name="Sethrathiel", value="Sethrathiel"),
+        app_commands.Choice(name="Avalea", value="Avalea"),
+    ]
+)
+async def add_character(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    character_name: str,
+    kingdom: Optional[app_commands.Choice[str]] = None,
+) -> None:
+    await _add_character_impl(interaction, user, character_name, kingdom.value if kingdom else None)
+
 
 
 
@@ -1510,7 +1554,7 @@ async def staff_commands(interaction: discord.Interaction):
 
     # Keep this list intentionally small and player-friendly (but staff-only).
     items: list[tuple[str, str]] = [
-        ("/character_add", "Add a new character for a player."),
+        ("/add_character", "Add a new character for a player."),
         ("/character_archive", "Archive or unarchive a character (hide/show on the dashboard)."),
         ("/character_archive_by_id", "Archive/unarchive by user ID (for players who left the server)."),
         ("/award_points", "Award legacy points to a character (positive or negative)."),
@@ -1713,7 +1757,7 @@ class VilyraBotClient(discord.Client):
             LOG.info("Self-check: Database methods OK (%d checked).", len(required_db_methods))
 
         required_commands = [
-            "set_server_rank", "add_character", "character_add", "award_legacy_points",
+            "set_server_rank", "add_character", "award_legacy_points",
             "convert_star", "reset_points", "reset_stars", "add_ability",
             "upgrade_ability", "refresh_dashboard", "char_card",
             "convert_points_to_stars",
@@ -1735,7 +1779,7 @@ class VilyraBotClient(discord.Client):
         # Register commands
         self.tree.add_command(set_server_rank)
         self.tree.add_command(set_char_kingdom)
-        self.tree.add_command(character_add)
+        self.tree.add_command(add_character)
         self.tree.add_command(character_archive)
         self.tree.add_command(character_archive_by_id)
         self.tree.add_command(character_delete)
@@ -1758,9 +1802,17 @@ class VilyraBotClient(discord.Client):
         try:
             gid = safe_int(os.getenv("GUILD_ID"), 0)
             if gid:
-                self.tree.copy_global_to(guild=discord.Object(id=gid))
-                synced = await self.tree.sync(guild=discord.Object(id=gid))
+                guild_obj = discord.Object(id=gid)
+
+                # IMPORTANT: Clear + resync to prevent Discord-side signature mismatches from older deployments.
+                # This is safe because we always re-upload the current command set immediately after clearing.
+                self.tree.clear_commands(guild=guild_obj)
+                await self.tree.sync(guild=guild_obj)
+
+                self.tree.copy_global_to(guild=guild_obj)
+                synced = await self.tree.sync(guild=guild_obj)
                 LOG.info("Guild sync succeeded: %s commands", len(synced))
+
                 if len(synced)==0:
                     LOG.warning("Guild sync returned 0 commands; attempting global sync fallback...")
                     try:
