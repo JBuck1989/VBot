@@ -57,6 +57,11 @@ SERVER_RANKS = [
     "Sovereign",
 ]
 
+
+# Kingdom dropdown options for character creation/moves
+Kingdom = Literal["Velarith", "Lyvik", "Baelon", "Sethrathiel", "Avalea"]
+KINGDOMS = ["Velarith", "Lyvik", "Baelon", "Sethrathiel", "Avalea"]
+
 class Kingdom(str, Enum):
     VELARITH = "Velarith"
     LYVIK = "Lyvik"
@@ -1164,17 +1169,27 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
 # Command guards
 # -----------------------------
 
-def staff_only():
+def staff_only(func=None):
+    """Decorator/check that restricts a slash-command to staff members.
+
+    Supports both usages:
+      @staff_only
+      @staff_only()
+    """
     async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.guild:
-            return False
-        if isinstance(interaction.user, discord.Member) and is_staff(interaction.user):
-            return True
-        await safe_reply(interaction, "Staff only (Guardian/Warden).")
-        return False
-    return app_commands.check(predicate)
+        return await is_staff(interaction)
 
+    check = app_commands.check(predicate)
 
+    # Used as @staff_only()
+    if func is None:
+        return check
+
+    # Used as @staff_only
+    return check(func)
+
+    # Used as @staff_only
+    return check(func)
 def in_guild_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -1308,31 +1323,23 @@ async def _add_character_impl(
 @staff_only
 @app_commands.command(name="add_character", description="Add a character for a user.")
 @app_commands.describe(user="The player", character_name="The character's name", kingdom="The character's kingdom")
+@app_commands.choices(kingdom=[
+    app_commands.Choice(name="Velarith", value="Velarith"),
+    app_commands.Choice(name="Lyvik", value="Lyvik"),
+    app_commands.Choice(name="Baelon", value="Baelon"),
+    app_commands.Choice(name="Sethrathiel", value="Sethrathiel"),
+    app_commands.Choice(name="Avalea", value="Avalea"),
+])
 async def add_character(
     interaction: discord.Interaction,
     user: discord.Member,
     character_name: str,
-    kingdom: Kingdom,
+    kingdom: app_commands.Choice[str],
 ):
-    await _add_character_impl(interaction, user, character_name, kingdom)
+    await _add_character_impl(interaction, user, character_name, kingdom.value)
 
 @app_commands.guild_only()
 @staff_only
-@app_commands.command(name="character_add", description="Add a character for a user.")
-@app_commands.describe(user="The player", character_name="The character's name", kingdom="The character's kingdom")
-async def character_add(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    character_name: str,
-    kingdom: Kingdom,
-):
-    await _add_character_impl(interaction, user, character_name, kingdom)
-
-
-
-
-
-
 @app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character (hide/show on dashboard).")
 @app_commands.guild_only()
 @staff_only()
@@ -1773,7 +1780,6 @@ class VilyraBotClient(discord.Client):
             LOG.info("Self-check: Database methods OK (%d checked).", len(required_db_methods))
 
         required_commands = [
-            "set_server_rank", "add_character", "character_add", "award_legacy_points",
             "convert_star", "reset_points", "reset_stars", "add_ability",
             "upgrade_ability", "refresh_dashboard", "char_card",
             "convert_points_to_stars",
@@ -1796,7 +1802,6 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(set_server_rank)
         self.tree.add_command(set_char_kingdom)
         self.tree.add_command(add_character)
-        self.tree.add_command(character_add)
         self.tree.add_command(character_archive)
         self.tree.add_command(character_archive_by_id)
         self.tree.add_command(character_delete)
