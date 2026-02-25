@@ -1,4 +1,4 @@
-# VB_v86 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v87 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -104,13 +104,13 @@ def safe_int(v: Any, default: int = 0) -> int:
 
 def parse_character_key(character: str) -> Tuple[int, str]:
     """Parse '<user_id>|<character_name>' from autocomplete selection."""
-    if "|" not in character:
-        raise ValueError("Invalid character selection. Please select from autocomplete.")
+    if "|" not in character_name:
+        raise ValueError("Invalid character_name selection. Please select from autocomplete.")
     user_id_str, name = character.split("|", 1)
     user_id = int(user_id_str.strip())
     name = name.strip()
     if not name:
-        raise ValueError("Invalid character selection.")
+        raise ValueError("Invalid character_name selection.")
     return user_id, name
 
 
@@ -118,7 +118,7 @@ async def autocomplete_character_guild(
     interaction: discord.Interaction,
     current: str,
 ) -> List[app_commands.Choice[str]]:
-    """Guild-wide character picker for all commands (no DB schema change)."""
+    """Guild-wide character_name picker for all commands (no DB schema change)."""
     try:
         if interaction.guild is None:
             return []
@@ -318,7 +318,7 @@ class Database:
 
         # Detected "level" column in abilities (upgrade_level vs level)
         self.abilities_level_col: str = "upgrade_level"
-        # Detected "character name" column in abilities (character_name vs name)
+        # Detected "character_name name" column in abilities (character_name vs name)
         self.abilities_char_col: str = "character_name"
 
     async def connect(self) -> None:
@@ -381,7 +381,7 @@ class Database:
         else:
             self.abilities_level_col = "upgrade_level"  # will be added
 
-        # Abilities: character column
+        # Abilities: character_name column
         if "character_name" in self.abilities_cols:
             self.abilities_char_col = "character_name"
         elif "name" in self.abilities_cols:
@@ -389,7 +389,7 @@ class Database:
         else:
             self.abilities_char_col = "character_name"  # will be added
 
-        LOG.info("Schema choices: abilities.%s as level, abilities.%s as character key",
+        LOG.info("Schema choices: abilities.%s as level, abilities.%s as character_name key",
                  self.abilities_level_col, self.abilities_char_col)
 
     async def init_schema(self) -> None:
@@ -530,7 +530,7 @@ class Database:
         )
 
     async def set_character_archived(self, guild_id: int, user_id: int, character_name: str, archived: bool) -> bool:
-        """Archive/unarchive a character. Returns True if a row was updated."""
+        """Archive/unarchive a character_name. Returns True if a row was updated."""
         sql = """
             UPDATE characters
                SET archived=%s,
@@ -543,7 +543,7 @@ class Database:
         return bool(rowcount and rowcount > 0)
 
     async def delete_character(self, guild_id: int, user_id: int, character_name: str) -> bool:
-        """Hard-delete a character and its abilities. Returns True if a character row was deleted."""
+        """Hard-delete a character_name and its abilities. Returns True if a character_name row was deleted."""
         # Delete abilities first (if any)
         await self._execute(
             "DELETE FROM abilities WHERE guild_id=%s AND user_id=%s AND character_name=%s;",
@@ -557,7 +557,7 @@ class Database:
 
 
     async def set_character_kingdom(self, guild_id: int, user_id: int, character_name: str, kingdom: str) -> bool:
-        """Set a character's home kingdom. Returns True if updated."""
+        """Set a character_name's home kingdom. Returns True if updated."""
         sql = """
             UPDATE characters
                SET kingdom=%s,
@@ -576,11 +576,11 @@ async def rename_character(
     old_name: str,
     new_name: str,
 ) -> bool:
-    """Rename a character while preserving all associated stats/points stored in characters row.
+    """Rename a character_name while preserving all associated stats/points stored in characters row.
 
     Updates:
     - characters.name for the specific (guild_id, user_id, old_name)
-    - abilities.{char_col} for that same character (if abilities table exists)
+    - abilities.{char_col} for that same character_name (if abilities table exists)
 
     Optional:
     - If FEATURE_RENAME_CASCADE is enabled and RENAME_CASCADE_TARGETS is set,
@@ -589,9 +589,9 @@ async def rename_character(
     old_name = (old_name or "").strip()
     new_name = (new_name or "").strip()
     if not old_name or not new_name:
-        raise ValueError("Both old and new character names are required.")
+        raise ValueError("Both old and new character_name names are required.")
     if len(new_name) > MAX_NAME_LEN:
-        raise ValueError(f"New character name too long (max {MAX_NAME_LEN}).")
+        raise ValueError(f"New character_name name too long (max {MAX_NAME_LEN}).")
 
     conn = self._require_conn()
     async with conn.transaction():
@@ -607,7 +607,7 @@ async def rename_character(
             (guild_id, user_id, new_name),
         )
         if collision:
-            raise ValueError("A character with that name already exists for this user.")
+            raise ValueError("A character_name with that name already exists for this user.")
 
         updated = await self._execute(
             "UPDATE characters SET name=%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s",
@@ -944,7 +944,7 @@ async def list_all_characters_for_guild(
         if len(current) >= cap:
             raise ValueError(f"Ability capacity reached ({len(current)}/{cap}). Earn more Ability Stars to add abilities.")
 
-        # Insert using whatever character column exists; also initialize both level columns if present.
+        # Insert using whatever character_name column exists; also initialize both level columns if present.
         char_col = self._ability_where_char()
         cols = ["guild_id", "user_id", char_col, "ability_name", "created_at"]
         vals = ["%s", "%s", "%s", "%s", "NOW()"]
@@ -1172,7 +1172,7 @@ def render_character_block(card: CharacterCard) -> str:
     lines: List[str] = []
     # Keep the decorative header but bold the name and add spacing so it doesn't wrap awkwardly on mobile
     lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
-    # Kingdom directly under the character name.
+    # Kingdom directly under the character_name name.
     # Always show the line; if NULL/empty/unassigned, show a blank value (per spec).
     k = (card.kingdom or "").strip()
     if (not k) or (k.lower() == "unassigned"):
@@ -1368,21 +1368,22 @@ async def set_server_rank(interaction: discord.Interaction, user: discord.Member
 
 
 
-@app_commands.command(name="set_char_kingdom", description="(Staff) Set a character's home kingdom.")
+@app_commands.command(name="set_char_kingdom", description="(Staff) Set a character_name's home kingdom.")
 @in_guild_only()
 @staff_only
-@app_commands.describe(character="Character (select from autocomplete)", kingdom="New home kingdom")
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.describe(
+    character_name="Character (select from autocomplete)", kingdom="New home kingdom")
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 @app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
 async def set_char_kingdom(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     kingdom: str,
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(interaction.client.db.set_character_kingdom(interaction.guild.id, user_id, character_name, kingdom), "set_character_kingdom(db)")
@@ -1396,8 +1397,8 @@ async def set_char_kingdom(
     except Exception as e:
         await send_error(interaction, e)
 
-@app_commands.command(name="add_character", description="Add a character for a user.")
-@app_commands.describe(user="The player", character_name="The character's name", kingdom="The character's kingdom")
+@app_commands.command(name="add_character", description="Add a character_name for a user.")
+@app_commands.describe(user="The player", character_name="The character_name's name", kingdom="The character_name's kingdom")
 @app_commands.choices(kingdom=[
     app_commands.Choice(name="Velarith", value="Velarith"),
     app_commands.Choice(name="Lyvik", value="Lyvik"),
@@ -1416,24 +1417,25 @@ async def add_character(
 @app_commands.guild_only()
 @staff_only
 
-@app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character (hide/show on dashboard).")
+@app_commands.command(name="character_archive", description="(Staff) Archive or unarchive a character_name (hide/show on dashboard).")
 @in_guild_only()
 @staff_only
-@app_commands.describe(character="Character (select from autocomplete)", action="Archive or unarchive")
+@app_commands.describe(
+    character_name="Character (select from autocomplete)", action="Archive or unarchive")
 @app_commands.choices(action=[
     app_commands.Choice(name="Archive", value="archive"),
     app_commands.Choice(name="Unarchive", value="unarchive"),
 ])
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def character_archive(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     action: app_commands.Choice[str],
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         archived = True if action.value == "archive" else False
@@ -1451,19 +1453,20 @@ async def character_archive(
         await send_error(interaction, e)
 
 
-@app_commands.command(name="character_delete", description="(Staff) Delete a character (cannot be undone).")
+@app_commands.command(name="character_delete", description="(Staff) Delete a character_name (cannot be undone).")
 @in_guild_only()
 @staff_only
-@app_commands.describe(character="Character (select from autocomplete)")
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.describe(
+    character_name="Character (select from autocomplete)")
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def character_delete(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         deleted = await interaction.client.db.delete_character(interaction.guild.id, user_id, character_name)
@@ -1480,19 +1483,19 @@ async def character_delete(
 
 
 
-@app_commands.command(name="character_rename", description="(Staff) Rename a character (preserves points/stars).")
+@app_commands.command(name="character_rename", description="(Staff) Rename a character_name (preserves points/stars).")
 @in_guild_only()
 @staff_only
 @app_commands.describe(
-    character="Character (select from autocomplete)",
-    new_name="New character name",
+    character_name="Character (select from autocomplete)",
+    new_name="New character_name name",
 )
 @app_commands.autocomplete(
-    character=autocomplete_character_guild,
+    character_name=autocomplete_character_guild,
 )
 async def character_rename(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     new_name: str,
 ) -> None:
     await defer_ephemeral(interaction)
@@ -1501,7 +1504,7 @@ async def character_rename(
         if not FEATURE_CHARACTER_RENAME:
             raise RuntimeError("Character rename is currently disabled.")
 
-        user_id, old_name = parse_character_key(character)
+        user_id, old_name = parse_character_key(character_name)
         new_name = (new_name or "").strip()
         if not new_name:
             raise ValueError("New name is required.")
@@ -1517,7 +1520,7 @@ async def character_rename(
         if not ok:
             raise RuntimeError("Character not found.")
 
-        await log_command(interaction, f"Renamed character: {old_name} -> {new_name} (user_id={user_id})")
+        await log_command(interaction, f"Renamed character_name: {old_name} -> {new_name} (user_id={user_id})")
         await interaction.followup.send(f"✅ Renamed **{old_name}** → **{new_name}**.", ephemeral=True)
 
         await refresh_dashboard_for_guild(interaction.client, interaction.guild.id)
@@ -1525,20 +1528,20 @@ async def character_rename(
     except Exception as e:
         await interaction.followup.send(f"❌ {e}", ephemeral=True)
 
-@app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
+@app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character_name.")
 @in_guild_only()
 @staff_only
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def award_legacy_points(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     positive: int = 0,
     negative: int = 0,
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         if positive == 0 and negative == 0:
@@ -1567,10 +1570,10 @@ async def award_legacy_points(
 ])
 @in_guild_only()
 @staff_only
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def convert_star(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     star_type: app_commands.Choice[str],
     stars: int,
     spend_plus: int,
@@ -1579,7 +1582,7 @@ async def convert_star(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(
@@ -1615,13 +1618,13 @@ async def staff_commands(interaction: discord.Interaction):
 
     # Keep this list intentionally small and player-friendly (but staff-only).
     items: list[tuple[str, str]] = [
-        ("/add_character", "Add a new character for a player."),
-        ("/character_archive", "Archive or unarchive a character (hide/show on the dashboard)."),
-        ("/award_points", "Award legacy points to a character (positive or negative)."),
-        ("/add_ability", "Add a new ability to a character (does not spend stars)."),
+        ("/add_character", "Add a new character_name for a player."),
+        ("/character_archive", "Archive or unarchive a character_name (hide/show on the dashboard)."),
+        ("/award_points", "Award legacy points to a character_name (positive or negative)."),
+        ("/add_ability", "Add a new ability to a character_name (does not spend stars)."),
         ("/upgrade_ability", "Upgrade an existing ability (costs legacy points; max 5 upgrades)."),
         ("/refresh_dashboard", "Force-refresh a player’s dashboard post right now."),
-        ("/char_card", "Show a character card (ephemeral) exactly like the dashboard view."),
+        ("/char_card", "Show a character_name card (ephemeral) exactly like the dashboard view."),
     ]
 
     lines = ["**Staff Commands**", ""]
@@ -1631,13 +1634,13 @@ async def staff_commands(interaction: discord.Interaction):
 
 
 
-@app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character (use for corrections).")
+@app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character_name (use for corrections).")
 @in_guild_only()
 @staff_only
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def reset_points(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     legacy_plus: int = 0,
     legacy_minus: int = 0,
     lifetime_plus: int = 0,
@@ -1646,7 +1649,7 @@ async def reset_points(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(
@@ -1673,20 +1676,20 @@ async def reset_points(
         await send_error(interaction, e)
 
 
-@app_commands.command(name="reset_stars", description="(Staff) Set ability stars and/or influence stars for a character.")
+@app_commands.command(name="reset_stars", description="(Staff) Set ability stars and/or influence stars for a character_name.")
 @in_guild_only()
 @staff_only
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def reset_stars(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     ability_stars: Optional[int] = None,
     influence_stars: Optional[int] = None,
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(
@@ -1711,19 +1714,19 @@ async def reset_stars(
         await send_error(interaction, e)
 
 
-@app_commands.command(name="add_ability", description="(Staff) Add an ability to a character (capacity = 2 + ability stars).")
+@app_commands.command(name="add_ability", description="(Staff) Add an ability to a character_name (capacity = 2 + ability stars).")
 @in_guild_only()
 @staff_only
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def add_ability(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     ability_name: str,
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
         ability_name = ability_name.strip()
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
@@ -1742,10 +1745,10 @@ async def add_ability(
 @app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points per upgrade (max 5 upgrades per ability). Requires explicit +/− split.")
 @in_guild_only()
 @staff_only
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def upgrade_ability(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
     ability_name: str,
     positive: int = 0,
     negative: int = 0,
@@ -1753,7 +1756,7 @@ async def upgrade_ability(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
         ability_name = ability_name.strip()
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
@@ -1785,17 +1788,17 @@ async def refresh_dashboard(interaction: discord.Interaction):
 
 
 
-@app_commands.command(name="char_card", description="Show a character card ephemerally.")
+@app_commands.command(name="char_card", description="Show a character_name card ephemerally.")
 @in_guild_only()
-@app_commands.autocomplete(character=autocomplete_character_guild)
+@app_commands.autocomplete(character_name=autocomplete_character_guild)
 async def char_card(
     interaction: discord.Interaction,
-    character: str,
+    character_name: str,
 ):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character)
+        user_id, character_name = parse_character_key(character_name)
 
         member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
         if user_id != interaction.user.id and not (member and is_staff(member)):
