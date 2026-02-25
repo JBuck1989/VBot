@@ -1363,6 +1363,37 @@ async def character_rename(interaction: discord.Interaction, character_name: str
         await send_error(interaction, e)
 
 
+
+@app_commands.command(name="staff_commands", description="(Staff) Show a quick list of staff commands and what they do.")
+@in_guild_only()
+@staff_only
+async def staff_commands(interaction: discord.Interaction):
+    await defer_ephemeral(interaction)
+    try:
+        lines = [
+            "**Staff Commands**",
+            "",
+            "• **/add_character** — Add a new character for a player.",
+            "• **/character_archive** — Archive/unarchive a character (hide/show on dashboard).",
+            "• **/character_delete** — Delete a character (cannot be undone).",
+            "• **/character_rename** — Rename a character (preserves stats; updates abilities).",
+            "• **/set_char_kingdom** — Set a character’s home kingdom.",
+            "• **/set_server_rank** — Set a player’s server rank.",
+            "• **/award_points** — Award legacy points (positive or negative).",
+            "• **/convert_star** — Convert available legacy points into stars (10 points per star).",
+            "• **/reset_points** — Correct legacy/lifetime totals for a character.",
+            "• **/reset_stars** — Correct ability/influence stars for a character.",
+            "• **/add_ability** — Add an ability (capacity = 2 + ability stars).",
+            "• **/upgrade_ability** — Upgrade an ability (5 points per upgrade; max 5).",
+            "• **/refresh_dashboard** — Force-refresh the dashboard posts.",
+            "• **/debug_characters** — Debug: show character counts for this guild.",
+            "• **/char_card** — Show a character card (ephemeral).",
+        ]
+        await safe_reply(interaction, "\n".join(lines))
+    except Exception as e:
+        LOG.exception("staff_commands failed")
+        await safe_reply(interaction, f"❌ {e}")
+
 @app_commands.command(name="award_points", description="(Staff) Award legacy points to a character (+ and/or -).")
 @in_guild_only()
 @staff_only()
@@ -1592,42 +1623,55 @@ class VilyraBotClient(discord.Client):
         self.dashboard_limiter = SimpleRateLimiter(DASHBOARD_EDIT_MIN_INTERVAL)
         self._did_hard_sync = False
 
-    async def setup_hook(self) -> None:
-        for cmd in [
-            set_server_rank,
-            add_character,
-            set_char_kingdom,
-            character_archive,
-            character_delete,
-            character_rename,
-            award_points,
-            convert_star,
-            reset_points,
-            reset_stars,
-            add_ability,
-            upgrade_ability,
-            refresh_dashboard,
-            debug_characters,
-            char_card,
-        ]:
+    
+
+async def setup_hook(self) -> None:
+    # Register commands.
+    # IMPORTANT: To avoid Discord showing duplicates (global + guild),
+    # we register commands as *guild commands* when GUILD_ID is set.
+    gid = safe_int(os.getenv("GUILD_ID"), 0)
+    guild_obj = discord.Object(id=gid) if gid else None
+
+    def add(cmd):
+        if guild_obj is not None:
+            self.tree.add_command(cmd, guild=guild_obj)
+        else:
             self.tree.add_command(cmd)
 
-        names = [c.name for c in self.tree.get_commands()]
+    # Single source of truth (these command functions are defined below)
+    add(staff_commands)
+    add(set_server_rank)
+    add(add_character)
+    add(set_char_kingdom)
+    add(character_archive)
+    add(character_delete)
+    add(character_rename)
+    add(award_points)
+    add(convert_star)
+    add(reset_points)
+    add(reset_stars)
+    add(add_ability)
+    add(upgrade_ability)
+    add(refresh_dashboard)
+    add(debug_characters)
+    add(char_card)
+
+    # Self-check: ensure no duplicate names in the prepared tree
+    try:
+        cmds = self.tree.get_commands(guild=guild_obj) if guild_obj else self.tree.get_commands()
+        names = [c.name for c in cmds]
         dupes = sorted({n for n in names if names.count(n) > 1})
         if dupes:
-            raise RuntimeError(f"Duplicate command name(s) detected: {dupes}")
+            raise RuntimeError(f"Duplicate command name(s) detected in code: {dupes}")
+        LOG.info("Command tree prepared: %s command(s); GUILD_ID=%s", len(names), gid)
+    except Exception:
+        LOG.exception("Self-check: Command tree validation failed")
 
-        LOG.info("Command tree prepared: %s command(s); GUILD_ID=%s", len(names), safe_int(os.getenv("GUILD_ID"), 0))
-        await self._guild_sync_guarded()
-
-    async def _guild_sync_guarded(self) -> None:
-        try:
-            gid = safe_int(os.getenv("GUILD_ID"), 0)
-            if not gid:
-                return
-
+    # Sync commands
+    try:
+        if guild_obj is not None and gid:
             raw_allow = (os.getenv("ALLOWED_GUILD_IDS") or "").strip()
-            allowed: Optional[set[int]] = None
+            allowed = None
             if raw_allow:
                 try:
                     allowed = {int(x.strip()) for x in raw_allow.split(",") if x.strip()}
@@ -1638,19 +1682,36 @@ class VilyraBotClient(discord.Client):
                 LOG.error("GUILD_ID %s not in ALLOWED_GUILD_IDS; skipping guild sync/reset.", gid)
                 return
 
-            allow_reset = (os.getenv("ALLOW_COMMAND_RESET") or "").strip().lower() in ("1", "true", "yes", "y", "on")
-            guild_obj = discord.Object(id=gid)
-
-            self.tree.copy_global_to(guild=guild_obj)
-
+            allow_reset = (os.getenv("ALLOW_COMMAND_RESET") or "").strip().lower() in ("1","true","yes","y","on")
             if allow_reset:
+                # Hard reset guild commands: replace guild commands with an empty set, then sync.
                 await self.http.bulk_upsert_guild_commands(self.application_id, gid, [])
                 LOG.warning("Performed hard guild command reset (ALLOW_COMMAND_RESET=true) for guild %s", gid)
 
+            # Sync (Discord bulk overwrite semantics) — this also prunes stale guild commands.
             synced = await self.tree.sync(guild=guild_obj)
             LOG.info("Guild command sync complete: %s commands (hard_reset=%s)", len(synced), allow_reset)
-        except Exception:
-            LOG.exception("Guild command sync failed")
+
+        # Optional: clear GLOBAL commands to eliminate duplicates in the UI.
+        # Only do this if explicitly enabled (and still guarded by ALLOWED_GUILD_IDS).
+        allow_global_reset = (os.getenv("ALLOW_GLOBAL_COMMAND_RESET") or "").strip().lower() in ("1","true","yes","y","on")
+        if allow_global_reset and self.application_id:
+            raw_allow = (os.getenv("ALLOWED_GUILD_IDS") or "").strip()
+            allowed = None
+            if raw_allow:
+                try:
+                    allowed = {int(x.strip()) for x in raw_allow.split(",") if x.strip()}
+                except Exception:
+                    allowed = None
+            # If allowlist is set, require the current gid be allowed (prevents accidental wipes in other servers)
+            if allowed and gid and gid not in allowed:
+                LOG.error("Global reset requested, but GUILD_ID %s not in ALLOWED_GUILD_IDS; skipping global reset.", gid)
+            else:
+                await self.http.bulk_upsert_global_commands(self.application_id, [])
+                LOG.warning("Performed GLOBAL command reset (ALLOW_GLOBAL_COMMAND_RESET=true)")
+
+    except Exception:
+        LOG.exception("Command sync/reset failed")
 
     async def on_ready(self) -> None:
         LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
