@@ -1,4 +1,4 @@
-# VB_v82 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v83 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -120,46 +120,15 @@ def is_staff(member: discord.abc.User | discord.Member) -> bool:
 async def staff_check(interaction: discord.Interaction) -> bool:
     """app_commands check predicate (must be async-safe)."""
     if interaction.guild is None:
-        re
-async def autocomplete_character_global_key(
-    interaction: discord.Interaction,
-    current: str,
-) -> List[app_commands.Choice[str]]:
-    """Staff-only: search ALL characters in this guild (including archived), returning a composite key.
-
-    Value format: "<user_id>|<character_name>"
-    """
-    try:
-        if interaction.guild is None:
-            return []
-        if not is_staff(interaction):
-            return []
-
-        rows = await interaction.client.db.list_all_characters_for_guild(
-            interaction.guild.id,
-            include_archived=True,
-            name_filter=current or None,
-            limit=50,
-        )
-        choices: List[app_commands.Choice[str]] = []
-        for r in rows[:25]:
-            uid = int(r["user_id"])
-            name = str(r["name"])
-            archived = bool(r.get("archived", False))
-            label = f"{name} — {uid}" + (" (archived)" if archived else "")
-            value = f"{uid}|{name}"
-            choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
-        return choices
-    except Exception:
-        return []
-
-
-return False
-    member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+        return False
+    member = (
+        interaction.user
+        if isinstance(interaction.user, discord.Member)
+        else interaction.guild.get_member(interaction.user.id)
+    )
     if member is None:
         return False
     return is_staff(member)
-
 
 # Decorator to use as "@staff_only" (NO parentheses)
 staff_only = app_commands.check(staff_check)
@@ -1904,10 +1873,10 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(set_char_kingdom)
         self.tree.add_command(add_character)
         self.tree.add_command(character_archive)
-self.tree.add_command(character_delete)
+        self.tree.add_command(character_delete)
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
-self.tree.add_command(staff_commands)
+        self.tree.add_command(staff_commands)
         self.tree.add_command(reset_points)
         self.tree.add_command(reset_stars)
         self.tree.add_command(add_ability)
