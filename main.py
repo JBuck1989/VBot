@@ -1,4 +1,4 @@
-# VB_v91 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v92 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -702,6 +702,41 @@ async def rename_character(
 
 
 
+
+
+    async def list_all_characters_for_guild(
+        self,
+        guild_id: int,
+        include_archived: bool = True,
+        name_filter: str = "",
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """List characters for a guild for autocomplete.
+
+        Returns rows with: user_id, name, archived.
+        """
+        name_filter = (name_filter or "").strip()
+        lim = max(1, min(int(limit or 25), 200))
+
+        where = ["guild_id=%s"]
+        params: List[Any] = [guild_id]
+
+        if not include_archived:
+            where.append("COALESCE(archived, FALSE)=FALSE")
+
+        if name_filter:
+            where.append("name ILIKE %s")
+            params.append(f"%{name_filter}%")
+
+        sql = f"""
+            SELECT user_id, name, COALESCE(archived, FALSE) AS archived
+            FROM characters
+            WHERE {' AND '.join(where)}
+            ORDER BY COALESCE(archived, FALSE) ASC, name ASC, user_id ASC
+            LIMIT {lim};
+        """
+        return await self._fetchall(sql, tuple(params))
+
     async def list_player_ids(self, guild_id: int) -> List[int]:
         rows = await self._fetchall(
             """
@@ -1315,7 +1350,18 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
 
 
 async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild) -> str:
-    user_ids = await client.db.list_player_ids(guild.id)
+    user_ids = []
+    try:
+        user_ids = await client.db.list_player_ids(guild.id)
+    except Exception:
+        LOG.exception("list_player_ids failed during refresh_all_dashboards")
+        user_ids = []
+    if not user_ids:
+        rows = await client.db._fetchall(
+            "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC;",
+            (guild.id,),
+        )
+        user_ids = [int(r["user_id"]) for r in rows if r and r.get("user_id") is not None]
     if not user_ids:
         user_ids = await client.db.list_character_owner_ids(guild.id)
     if not user_ids:
@@ -1792,6 +1838,32 @@ async def refresh_dashboard(interaction: discord.Interaction):
 
 
 
+
+
+@app_commands.command(name="debug_characters", description="(Staff) Debug: show character counts for this guild.")
+@in_guild_only()
+@staff_only
+async def debug_characters(interaction: discord.Interaction) -> None:
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        rows = await interaction.client.db._fetchall(
+            "SELECT COALESCE(archived, FALSE) AS archived, COUNT(*) AS n FROM characters WHERE guild_id=%s GROUP BY COALESCE(archived, FALSE) ORDER BY COALESCE(archived, FALSE)",
+            (interaction.guild.id,),
+        )
+        total = 0
+        parts = []
+        for r in rows:
+            n = int(r["n"])
+            total += n
+            parts.append(f"archived={bool(r['archived'])}: {n}")
+        msg = " | ".join(parts) if parts else "no rows"
+        await interaction.followup.send(f"Guild {interaction.guild.id}: characters total={total} ({msg})", ephemeral=True)
+    except Exception as e:
+        LOG.exception("debug_characters failed")
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+
+
 @app_commands.command(name="char_card", description="Show a character_name card ephemerally.")
 @in_guild_only()
 @app_commands.autocomplete(character_name=autocomplete_character_guild)
@@ -1841,7 +1913,7 @@ async def list_character_owner_ids(self, guild_id: int) -> List[int]:
     )
     return [int(r["user_id"]) for r in rows]
 
-async def list_all_characters_for_guild(
+async def _legacy_list_all_characters_for_guild(
     self,
     guild_id: int,
     *,
@@ -1903,6 +1975,7 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
         self.tree.add_command(staff_commands)
+        self.tree.add_command(debug_characters)
         self.tree.add_command(reset_points)
         self.tree.add_command(reset_stars)
         self.tree.add_command(add_ability)
