@@ -1,4 +1,4 @@
-# VB_v97 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v98 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -1426,6 +1426,50 @@ def in_guild_only():
             return False
         return True
     return app_commands.check(predicate)
+
+
+def staff_only():
+    """Decorator: restrict command to server staff/admin.
+
+    Policy:
+    - Always requires guild context.
+    - Allows if user is guild owner OR has Administrator OR Manage Guild permission.
+    - Optional allowlist via STAFF_USER_IDS env var (comma-separated Discord user IDs).
+    """
+    staff_user_ids: set[int] = set()
+    raw = os.getenv("STAFF_USER_IDS", "") or ""
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            staff_user_ids.add(int(part))
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await safe_reply(interaction, "This command can only be used in a server.")
+            return False
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(interaction.user.id)  # type: ignore
+
+        # allowlist
+        if interaction.user.id in staff_user_ids:
+            return True
+
+        # guild owner
+        if interaction.guild.owner_id == interaction.user.id:
+            return True
+
+        if isinstance(member, discord.Member):
+            perms = member.guild_permissions
+            if perms.administrator or perms.manage_guild:
+                return True
+
+        await safe_reply(interaction, "You don't have permission to use this command.")
+        return False
+
+    return app_commands.check(predicate)
+
 
 
 async def require_character(db: Database, guild_id: int, user_id: int, name: str) -> None:
