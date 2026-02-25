@@ -1,4 +1,4 @@
-# VB_v89 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v90 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -114,12 +114,11 @@ def parse_character_key(character: str) -> Tuple[int, str]:
     return user_id, name
 
 
-
 async def resolve_character_input(
     interaction: discord.Interaction,
     character_name: str,
 ) -> Tuple[int, str]:
-    """Resolve character input: composite key from autocomplete or unique plain-name fallback."""
+    """Resolve character input: '<user_id>|<name>' preferred; unique plain-name fallback."""
     character_name = (character_name or "").strip()
     if not character_name:
         raise ValueError("Character is required.")
@@ -139,6 +138,7 @@ async def resolve_character_input(
     if len(matches) == 0:
         raise ValueError("Character not found. Please select from autocomplete.")
     raise ValueError("Multiple characters share that name. Please select from autocomplete.")
+
 
 
 async def autocomplete_character_guild(
@@ -747,15 +747,6 @@ async def list_all_characters_for_guild(
         )
         return [int(r["user_id"]) for r in rows if r and r.get("user_id") is not None]
 
-
-async def list_character_owner_ids(self, guild_id: int) -> List[int]:
-    """Fallback: return distinct user_ids that have characters in this guild."""
-    rows = await self._fetchall(
-        "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC",
-        (guild_id,),
-    )
-    return [int(r["user_id"]) for r in rows]
-
     async def get_character_state(self, guild_id: int, user_id: int, name: str) -> Dict[str, Any]:
         row = await self._fetchone(
             """
@@ -1179,6 +1170,40 @@ async def list_character_owner_ids(self, guild_id: int) -> List[int]:
 
 
     # -------- Dashboard message tracking --------
+
+
+async def list_character_owner_ids(self, guild_id: int) -> List[int]:
+    """Fallback: distinct user_ids that have characters in this guild."""
+    rows = await self._fetchall(
+        "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC",
+        (guild_id,),
+    )
+    return [int(r["user_id"]) for r in rows]
+async def list_all_characters_for_guild(
+    self,
+    guild_id: int,
+    *,
+    include_archived: bool = True,
+    name_filter: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """List characters in a guild (optionally filtered)."""
+    where = ["guild_id=%s"]
+    params: List[Any] = [guild_id]
+    if not include_archived:
+        where.append("COALESCE(archived, FALSE)=FALSE")
+    if name_filter:
+        where.append("name ILIKE %s")
+        params.append(f"%{name_filter}%")
+    sql = f"""
+        SELECT user_id, name, COALESCE(archived, FALSE) AS archived
+        FROM characters
+        WHERE {' AND '.join(where)}
+        ORDER BY COALESCE(archived, FALSE) ASC, name ASC
+        LIMIT %s
+    """
+    params.append(int(limit))
+    return await self._fetchall(sql, tuple(params))
 
 
 @dataclass
