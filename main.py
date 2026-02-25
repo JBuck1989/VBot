@@ -1,4 +1,4 @@
-# VB_v79 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v81 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -120,7 +120,41 @@ def is_staff(member: discord.abc.User | discord.Member) -> bool:
 async def staff_check(interaction: discord.Interaction) -> bool:
     """app_commands check predicate (must be async-safe)."""
     if interaction.guild is None:
-        return False
+        re
+async def autocomplete_character_global_key(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Staff-only: search ALL characters in this guild (including archived), returning a composite key.
+
+    Value format: "<user_id>|<character_name>"
+    """
+    try:
+        if interaction.guild is None:
+            return []
+        if not is_staff(interaction):
+            return []
+
+        rows = await interaction.client.db.list_all_characters_for_guild(
+            interaction.guild.id,
+            include_archived=True,
+            name_filter=current or None,
+            limit=50,
+        )
+        choices: List[app_commands.Choice[str]] = []
+        for r in rows[:25]:
+            uid = int(r["user_id"])
+            name = str(r["name"])
+            archived = bool(r.get("archived", False))
+            label = f"{name} — {uid}" + (" (archived)" if archived else "")
+            value = f"{uid}|{name}"
+            choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
+        return choices
+    except Exception:
+        return []
+
+
+turn False
     member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
     if member is None:
         return False
@@ -1546,62 +1580,6 @@ async def character_delete(interaction: discord.Interaction, user: discord.Membe
         await safe_reply(interaction, f"Delete character failed: {e}")
 
 
-@app_commands.command(name="character_archive_by_id", description="(Staff) Archive/unarchive a character by user ID (use for players who left).")
-@in_guild_only()
-@staff_only
-@app_commands.describe(
-    user_id="Discord user ID of the player (numbers only).",
-    character_name="Exact character name to archive/unarchive.",
-    action="Archive hides the character from the dashboard; Unarchive shows it again.",
-)
-@app_commands.choices(
-    action=[
-        app_commands.Choice(name="Archive", value="archive"),
-        app_commands.Choice(name="Unarchive", value="unarchive"),
-    ]
-)
-@app_commands.autocomplete(character_name=character_name_autocomplete)
-async def character_archive_by_id(
-    interaction: discord.Interaction,
-    user_id: str,
-    character_name: str,
-    action: app_commands.Choice[str],
-):
-    """
-    Archive/unarchive a character when you can't pick the user via Discord's user picker (e.g., they left the server).
-    """
-    await defer_ephemeral(interaction)
-
-    uid_str = (user_id or "").strip()
-    if not uid_str.isdigit():
-        await interaction.followup.send("❌ `user_id` must be numbers only (a Discord user ID).", ephemeral=True)
-        return
-    uid = int(uid_str)
-
-    do_archive = (action.value == "archive")
-    try:
-        status = await run_db(
-            interaction.client.db.set_character_archived(interaction.guild.id, uid, character_name, do_archive),
-            "set_character_archived",
-        )
-    except Exception as e:
-        await interaction.followup.send(f"❌ Archive failed: {e}", ephemeral=True)
-        return
-
-    # Update dashboard for that user id (even if the user isn't in guild anymore, the post is keyed by user_id)
-    try:
-        dash_status = await refresh_player_dashboard(interaction.client, interaction.guild, uid)
-    except Exception as e:
-        dash_status = f"(Dashboard refresh failed: {e})"
-
-    verb = "archived" if do_archive else "unarchived"
-    await log_to_channel(
-        interaction.guild,
-        f"🗄 {interaction.user.mention} {verb} **{character_name}** for user_id={uid}",
-    )
-
-    await interaction.followup.send(f"✅ {verb.title()} **{character_name}** for user_id={uid}. {dash_status}", ephemeral=True)
-
 @app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
 @in_guild_only()
 @staff_only
@@ -1637,7 +1615,7 @@ async def _handle_convert_star_interaction(
     spend_positive: int,
     spend_negative: int,
 ) -> None:
-    """Shared implementation for /convert_star and (removed) /convert_points_to_stars."""
+    """Shared implementation for /convert_star."""
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
@@ -1690,26 +1668,6 @@ async def convert_star(
 ):
     await _handle_convert_star_interaction(interaction, user, character_name, star_type, stars, spend_positive, spend_negative)
 
-@app_commands.command(name="convert_points_to_stars", description="(Staff) Convert available legacy points into stars (10 points per star).")
-@app_commands.choices(star_type=[
-    app_commands.Choice(name="Ability Star", value="ability"),
-    app_commands.Choice(name="Positive Influence Star", value="influence_positive"),
-    app_commands.Choice(name="Negative Influence Star", value="influence_negative"),
-])
-@in_guild_only()
-@staff_only
-@app_commands.autocomplete(character_name=character_name_autocomplete)
-async def convert_points_to_stars(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    character_name: str,
-    star_type: Literal['ability','influence_positive','influence_negative'],
-    stars: int,
-    spend_positive: int,
-    spend_negative: int,
-):
-    await _handle_convert_star_interaction(interaction, user, character_name, star_type, stars, spend_positive, spend_negative)
-
 @app_commands.command(name="staff_commands", description="(Staff) Show a quick list of staff commands and what they do.")
 @in_guild_only()
 @staff_only
@@ -1721,11 +1679,9 @@ async def staff_commands(interaction: discord.Interaction):
     items: list[tuple[str, str]] = [
         ("/add_character", "Add a new character for a player."),
         ("/character_archive", "Archive or unarchive a character (hide/show on the dashboard)."),
-        ("(removed) /character_archive_by_id", "Archive/unarchive by user ID (for players who left the server)."),
-        ("/award_points", "Award legacy points to a character (positive or negative)."),
+        ("/award_legacy_points", "Award legacy points to a character (positive or negative)."),
         ("/add_ability", "Add a new ability to a character (does not spend stars)."),
         ("/upgrade_ability", "Upgrade an existing ability (costs legacy points; max 5 upgrades)."),
-        ("(removed) /convert_points_to_stars", "Convert available legacy points into stars (ability or influence)."),
         ("/refresh_dashboard", "Force-refresh a player’s dashboard post right now."),
         ("/char_card", "Show a character card (ephemeral) exactly like the dashboard view."),
     ]
@@ -1929,11 +1885,9 @@ class VilyraBotClient(discord.Client):
         required_commands = [
             "convert_star", "reset_points", "reset_stars", "add_ability",
             "upgrade_ability", "refresh_dashboard", "char_card",
-            "convert_points_to_stars",
-            "staff_commands",
+"staff_commands",
             "character_archive",
-            "character_archive_by_id",
-            "set_char_kingdom",
+"set_char_kingdom",
         ]
         present = {c.name for c in self.tree.get_commands()}
         missing_cmds = [c for c in required_commands if c not in present]
@@ -1950,12 +1904,10 @@ class VilyraBotClient(discord.Client):
         self.tree.add_command(set_char_kingdom)
         self.tree.add_command(add_character)
         self.tree.add_command(character_archive)
-        self.tree.add_command(character_archive_by_id)
-        self.tree.add_command(character_delete)
+self.tree.add_command(character_delete)
         self.tree.add_command(award_legacy_points)
         self.tree.add_command(convert_star)
-        self.tree.add_command(convert_points_to_stars)
-        self.tree.add_command(staff_commands)
+self.tree.add_command(staff_commands)
         self.tree.add_command(reset_points)
         self.tree.add_command(reset_stars)
         self.tree.add_command(add_ability)
@@ -1970,6 +1922,13 @@ class VilyraBotClient(discord.Client):
         # Sync commands
         try:
             gid = safe_int(os.getenv("GUILD_ID"), 0)
+            raw_allow = (os.getenv("ALLOWED_GUILD_IDS") or "").strip()
+            allowed_guild_ids = None
+            if raw_allow:
+                try:
+                    allowed_guild_ids = {int(x.strip()) for x in raw_allow.split(",") if x.strip()}
+                except Exception:
+                    allowed_guild_ids = None
             if gid and getattr(self, "application_id", None):
                 if allowed_guild_ids and gid not in allowed_guild_ids:
                     LOG.error("GUILD_ID %s is not in ALLOWED_GUILD_IDS; skipping guild sync/reset.", gid)
