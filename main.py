@@ -1,4 +1,4 @@
-# VB_v84 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v86 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -568,6 +568,81 @@ class Database:
         """
         rowcount = await self._execute(sql, (kingdom, guild_id, user_id, character_name))
         return rowcount > 0
+
+async def rename_character(
+    self,
+    guild_id: int,
+    user_id: int,
+    old_name: str,
+    new_name: str,
+) -> bool:
+    """Rename a character while preserving all associated stats/points stored in characters row.
+
+    Updates:
+    - characters.name for the specific (guild_id, user_id, old_name)
+    - abilities.{char_col} for that same character (if abilities table exists)
+
+    Optional:
+    - If FEATURE_RENAME_CASCADE is enabled and RENAME_CASCADE_TARGETS is set,
+      additional UPDATE statements will be executed in the same transaction.
+    """
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    if not old_name or not new_name:
+        raise ValueError("Both old and new character names are required.")
+    if len(new_name) > MAX_NAME_LEN:
+        raise ValueError(f"New character name too long (max {MAX_NAME_LEN}).")
+
+    conn = self._require_conn()
+    async with conn.transaction():
+        exists = await self._fetchone(
+            "SELECT 1 FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s LIMIT 1",
+            (guild_id, user_id, old_name),
+        )
+        if not exists:
+            return False
+
+        collision = await self._fetchone(
+            "SELECT 1 FROM characters WHERE guild_id=%s AND user_id=%s AND name=%s LIMIT 1",
+            (guild_id, user_id, new_name),
+        )
+        if collision:
+            raise ValueError("A character with that name already exists for this user.")
+
+        updated = await self._execute(
+            "UPDATE characters SET name=%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND name=%s",
+            (new_name, guild_id, user_id, old_name),
+        )
+        if updated <= 0:
+            return False
+
+        # Cascade within this bot: abilities
+        if self.abilities_cols:
+            char_col = self.abilities_char_col
+            await self._execute(
+                f"UPDATE abilities SET {char_col}=%s, updated_at=NOW() WHERE guild_id=%s AND user_id=%s AND {char_col}=%s",
+                (new_name, guild_id, user_id, old_name),
+            )
+
+        # Optional cascade for shared DB tables (economy bot, etc.)
+        if FEATURE_RENAME_CASCADE and RENAME_CASCADE_TARGETS:
+            targets = []
+            for part in RENAME_CASCADE_TARGETS.split(","):
+                part = part.strip()
+                if not part or ":" not in part:
+                    continue
+                table, col = part.split(":", 1)
+                table = table.strip()
+                col = col.strip()
+                if table and col:
+                    targets.append((table, col))
+            for table, col in targets:
+                await self._execute(
+                    f"UPDATE {table} SET {col}=%s WHERE guild_id=%s AND user_id=%s AND {col}=%s",
+                    (new_name, guild_id, user_id, old_name),
+                )
+
+        return True
 
 
     async def character_exists(self, guild_id: int, user_id: int, name: str) -> bool:
@@ -1403,6 +1478,53 @@ async def character_delete(
     except Exception as e:
         await send_error(interaction, e)
 
+
+
+@app_commands.command(name="character_rename", description="(Staff) Rename a character (preserves points/stars).")
+@in_guild_only()
+@staff_only
+@app_commands.describe(
+    character="Character (select from autocomplete)",
+    new_name="New character name",
+)
+@app_commands.autocomplete(
+    character=autocomplete_character_guild,
+)
+async def character_rename(
+    interaction: discord.Interaction,
+    character: str,
+    new_name: str,
+) -> None:
+    await defer_ephemeral(interaction)
+    try:
+        assert interaction.guild is not None
+        if not FEATURE_CHARACTER_RENAME:
+            raise RuntimeError("Character rename is currently disabled.")
+
+        user_id, old_name = parse_character_key(character)
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("New name is required.")
+        if len(new_name) > MAX_NAME_LEN:
+            raise ValueError(f"New name too long (max {MAX_NAME_LEN}).")
+
+        ok = await interaction.client.db.rename_character(
+            interaction.guild.id,
+            user_id,
+            old_name,
+            new_name,
+        )
+        if not ok:
+            raise RuntimeError("Character not found.")
+
+        await log_command(interaction, f"Renamed character: {old_name} -> {new_name} (user_id={user_id})")
+        await interaction.followup.send(f"✅ Renamed **{old_name}** → **{new_name}**.", ephemeral=True)
+
+        await refresh_dashboard_for_guild(interaction.client, interaction.guild.id)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+
 @app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
 @in_guild_only()
 @staff_only
@@ -1693,7 +1815,86 @@ async def char_card(
 
 
 
-async def on_ready(self) -> None:
+
+class VilyraBotClient(discord.Client):
+    """Main Discord client wrapper.
+
+    Holds:
+    - db: Database
+    - tree: app_commands.CommandTree
+    """
+
+    def __init__(self, db: Database) -> None:
+        intents = discord.Intents.default()
+        # Needed for member lookups / role checks in many guilds.
+        intents.members = True
+        super().__init__(intents=intents)
+
+        self.db = db
+        self.tree = app_commands.CommandTree(self)
+        self._did_hard_sync = False
+
+    async def setup_hook(self) -> None:
+        # Register commands (single source of truth)
+        self.tree.add_command(set_server_rank)
+        self.tree.add_command(set_char_kingdom)
+        self.tree.add_command(add_character)
+        self.tree.add_command(character_archive)
+        self.tree.add_command(character_delete)
+        self.tree.add_command(character_rename)
+        self.tree.add_command(award_legacy_points)
+        self.tree.add_command(convert_star)
+        self.tree.add_command(staff_commands)
+        self.tree.add_command(reset_points)
+        self.tree.add_command(reset_stars)
+        self.tree.add_command(add_ability)
+        self.tree.add_command(upgrade_ability)
+        self.tree.add_command(refresh_dashboard)
+        self.tree.add_command(char_card)
+
+        # Self-check: ensure no duplicate names in the prepared tree
+        try:
+            names = [c.name for c in self.tree.get_commands()]
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if dupes:
+                raise RuntimeError(f"Duplicate command name(s) detected: {dupes}")
+            LOG.info("Command tree prepared: %s command(s); GUILD_ID=%s", len(names), safe_int(os.getenv("GUILD_ID"), 0))
+        except Exception:
+            LOG.exception("Self-check: Command tree validation failed")
+
+        # Guild sync (and optional hard reset) — guarded
+        try:
+            gid = safe_int(os.getenv("GUILD_ID"), 0)
+            if gid:
+                raw_allow = (os.getenv("ALLOWED_GUILD_IDS") or "").strip()
+                allowed = None
+                if raw_allow:
+                    try:
+                        allowed = {int(x.strip()) for x in raw_allow.split(",") if x.strip()}
+                    except Exception:
+                        allowed = None
+
+                if allowed and gid not in allowed:
+                    LOG.error("GUILD_ID %s not in ALLOWED_GUILD_IDS; skipping guild sync/reset.", gid)
+                else:
+                    allow_reset = (os.getenv("ALLOW_COMMAND_RESET") or "").strip().lower() in ("1","true","yes","y","on")
+                    guild_obj = discord.Object(id=gid)
+                    # IMPORTANT: copy globals into guild scope before syncing
+                    self.tree.copy_global_to(guild=guild_obj)
+                    if allow_reset:
+                        await self.http.bulk_upsert_guild_commands(self.application_id, gid, [])
+                        LOG.warning("Performed hard guild command reset (ALLOW_COMMAND_RESET=true) for guild %s", gid)
+                    synced = await self.tree.sync(guild=guild_obj)
+                    LOG.info("Guild command sync complete: %s commands (hard_reset=%s)", len(synced), allow_reset)
+        except Exception:
+            LOG.exception("Hard guild command sync failed")
+
+    async def on_ready(self) -> None:
+        # Delegate to the shared implementation (keeps logic in one place)
+        await _on_ready_impl(self)
+
+
+async def _on_ready_impl(self) -> None:
     LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
 
     # One-time guild sync/reset (guarded) to eliminate Discord-side schema mismatches.
