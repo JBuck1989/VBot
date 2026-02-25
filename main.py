@@ -1,4 +1,4 @@
-# VB_v99 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v100 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -172,6 +172,43 @@ async def safe_reply(interaction: discord.Interaction, content: str, *, embed: d
             await interaction.response.send_message(content, ephemeral=True, embed=embed)
     except Exception:
         LOG.exception("Failed to send response/followup")
+
+
+async def autocomplete_character_guild(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Guild-wide character autocomplete.
+
+    Returns Choice.value as a disambiguating token 'user_id:name'.
+    """
+    try:
+        guild = interaction.guild
+        if guild is None:
+            return []
+        q = (current or "").strip()
+        rows = await interaction.client.db.list_all_characters_for_guild(
+            guild.id,
+            include_archived=True,
+            name_filter=q,
+            limit=25,
+        )
+        choices: List[app_commands.Choice[str]] = []
+        for r in rows:
+            name = str(r.get("name") or "").strip()
+            uid = int(r.get("user_id") or 0)
+            if not name or uid <= 0:
+                continue
+            # Discord choice name max 100 chars; keep readable
+            label = f"{name} (u{uid})"
+            if len(label) > 100:
+                label = label[:97] + "..."
+            value = f"{uid}:{name}"
+            choices.append(app_commands.Choice(name=label, value=value))
+        return choices
+    except Exception:
+        LOG.exception("Character autocomplete failed")
+        return []
 
 
 async def run_db(coro, label: str):
