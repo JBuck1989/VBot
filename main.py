@@ -1,10 +1,22 @@
-# VB_v93 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v94 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
 
 # Bump this whenever you change how dashboards/cards are rendered.
 # It forces a refresh even if player data hasn't changed (prevents "skip" from hiding template updates).
+
+async def send_error(interaction: discord.Interaction, error: Exception | str) -> None:
+    """Send a standardized ephemeral error message."""
+    msg = str(error)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+    except Exception:
+        LOG.exception("Failed to send error message")
+
 DASHBOARD_TEMPLATE_VERSION = 3
 
 import os
@@ -364,6 +376,86 @@ class Database:
         self.abilities_level_col: str = "upgrade_level"
         # Detected "character_name name" column in abilities (character_name vs name)
         self.abilities_char_col: str = "character_name"
+
+
+# --- Compatibility bridge ---
+# Guarantees certain methods exist even if prior edits placed them at module scope.
+def __getattr__(self, name: str):
+    if name == "list_player_ids":
+        return self._compat_list_player_ids
+    if name == "list_characters":
+        return self._compat_list_characters
+    if name == "list_all_characters_for_guild":
+        return self._compat_list_all_characters_for_guild
+    if name == "list_character_owner_ids":
+        return self._compat_list_character_owner_ids
+    raise AttributeError(f"{type(self).__name__!s} object has no attribute {name}")
+
+async def _compat_list_player_ids(self, guild_id: int) -> List[int]:
+    try:
+        rows = await self._fetchall(
+            "SELECT user_id FROM players WHERE guild_id=%s ORDER BY user_id ASC",
+            (guild_id,),
+        )
+        ids = [int(r["user_id"]) for r in rows]
+        if ids:
+            return ids
+    except Exception:
+        LOG.debug("players table unavailable/empty; falling back to characters user_ids", exc_info=True)
+
+    rows2 = await self._fetchall(
+        "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC",
+        (guild_id,),
+    )
+    return [int(r["user_id"]) for r in rows2]
+
+async def _compat_list_character_owner_ids(self, guild_id: int) -> List[int]:
+    rows = await self._fetchall(
+        "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC",
+        (guild_id,),
+    )
+    return [int(r["user_id"]) for r in rows]
+
+async def _compat_list_characters(self, guild_id: int, user_id: int, include_archived: bool = True) -> List[Dict[str, Any]]:
+    where = ["guild_id=%s", "user_id=%s"]
+    params: List[Any] = [guild_id, user_id]
+    if not include_archived:
+        where.append("COALESCE(archived, FALSE)=FALSE")
+    sql = f"""
+        SELECT name, user_id, guild_id, COALESCE(archived, FALSE) AS archived,
+               legacy_plus, legacy_minus, lifetime_plus, lifetime_minus,
+               influence_plus, influence_minus, ability_stars, kingdom,
+               created_at, updated_at
+        FROM characters
+        WHERE {' AND '.join(where)}
+        ORDER BY COALESCE(archived, FALSE) ASC, name ASC;
+    """
+    return await self._fetchall(sql, tuple(params))
+
+async def _compat_list_all_characters_for_guild(
+    self,
+    guild_id: int,
+    include_archived: bool = True,
+    name_filter: str = "",
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+    name_filter = (name_filter or "").strip()
+    lim = max(1, min(int(limit or 25), 200))
+    where = ["guild_id=%s"]
+    params: List[Any] = [guild_id]
+    if not include_archived:
+        where.append("COALESCE(archived, FALSE)=FALSE")
+    if name_filter:
+        where.append("name ILIKE %s")
+        params.append(f"%{name_filter}%")
+    sql = f"""
+        SELECT user_id, name, COALESCE(archived, FALSE) AS archived
+        FROM characters
+        WHERE {' AND '.join(where)}
+        ORDER BY COALESCE(archived, FALSE) ASC, name ASC, user_id ASC
+        LIMIT {lim};
+    """
+    return await self._fetchall(sql, tuple(params))
 
     async def connect(self) -> None:
         LOG.info("Connecting to PostgreSQL...")
@@ -1360,7 +1452,7 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
 async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild) -> str:
     user_ids = []
     try:
-        user_ids = await client.db.list_player_ids(guild.id)
+        user_ids = await getattr(client.db, 'list_player_ids')(guild.id)
     except Exception:
         LOG.exception("list_player_ids failed during refresh_all_dashboards")
         user_ids = []
@@ -1371,7 +1463,7 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
         )
         user_ids = [int(r["user_id"]) for r in rows if r and r.get("user_id") is not None]
     if not user_ids:
-        user_ids = await client.db.list_character_owner_ids(guild.id)
+        user_ids = await getattr(client.db, 'list_character_owner_ids')(guild.id)
     if not user_ids:
         return "No players with characters yet."
     ok = 0
