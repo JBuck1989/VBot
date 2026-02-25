@@ -1,4 +1,4 @@
-# VB_v88 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v89 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -114,6 +114,33 @@ def parse_character_key(character: str) -> Tuple[int, str]:
     return user_id, name
 
 
+
+async def resolve_character_input(
+    interaction: discord.Interaction,
+    character_name: str,
+) -> Tuple[int, str]:
+    """Resolve character input: composite key from autocomplete or unique plain-name fallback."""
+    character_name = (character_name or "").strip()
+    if not character_name:
+        raise ValueError("Character is required.")
+    if "|" in character_name:
+        return parse_character_key(character_name)
+
+    assert interaction.guild is not None
+    rows = await interaction.client.db.list_all_characters_for_guild(
+        interaction.guild.id,
+        include_archived=True,
+        name_filter=character_name,
+        limit=200,
+    )
+    matches = [r for r in rows if str(r.get("name","")).strip().lower() == character_name.lower()]
+    if len(matches) == 1:
+        return int(matches[0]["user_id"]), str(matches[0]["name"])
+    if len(matches) == 0:
+        raise ValueError("Character not found. Please select from autocomplete.")
+    raise ValueError("Multiple characters share that name. Please select from autocomplete.")
+
+
 async def autocomplete_character_guild(
     interaction: discord.Interaction,
     current: str,
@@ -128,16 +155,25 @@ async def autocomplete_character_guild(
             name_filter=current or None,
             limit=200,
         )
+        name_counts: Dict[str, int] = {}
+        for rr in rows:
+            n = str(rr.get("name", ""))
+            name_counts[n] = name_counts.get(n, 0) + 1
+
         choices: List[app_commands.Choice[str]] = []
         for r in rows[:25]:
             uid = int(r["user_id"])
             name = str(r["name"])
             archived = bool(r.get("archived", False))
-            label = name + (" (archived)" if archived else "")
+            base = name
+            if name_counts.get(name, 0) > 1:
+                base = f"{name} — {uid}"
+            label = base + (" (archived)" if archived else "")
             value = f"{uid}|{name}"
             choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
         return choices
     except Exception:
+        LOG.exception("Character autocomplete failed")
         return []
 
 def clamp(n: int, lo: int, hi: int) -> int:
@@ -710,6 +746,15 @@ async def list_all_characters_for_guild(
             (guild_id,),
         )
         return [int(r["user_id"]) for r in rows if r and r.get("user_id") is not None]
+
+
+async def list_character_owner_ids(self, guild_id: int) -> List[int]:
+    """Fallback: return distinct user_ids that have characters in this guild."""
+    rows = await self._fetchall(
+        "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC",
+        (guild_id,),
+    )
+    return [int(r["user_id"]) for r in rows]
 
     async def get_character_state(self, guild_id: int, user_id: int, name: str) -> Dict[str, Any]:
         row = await self._fetchone(
@@ -1315,6 +1360,8 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
 async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild) -> str:
     user_ids = await client.db.list_player_ids(guild.id)
     if not user_ids:
+        user_ids = await client.db.list_character_owner_ids(guild.id)
+    if not user_ids:
         return "No players with characters yet."
     ok = 0
     for uid in user_ids:
@@ -1383,7 +1430,7 @@ async def set_char_kingdom(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(interaction.client.db.set_character_kingdom(interaction.guild.id, user_id, character_name, kingdom), "set_character_kingdom(db)")
@@ -1435,7 +1482,7 @@ async def character_archive(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         archived = True if action.value == "archive" else False
@@ -1466,7 +1513,7 @@ async def character_delete(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         deleted = await interaction.client.db.delete_character(interaction.guild.id, user_id, character_name)
@@ -1504,7 +1551,7 @@ async def character_rename(
         if not FEATURE_CHARACTER_RENAME:
             raise RuntimeError("Character rename is currently disabled.")
 
-        user_id, old_name = parse_character_key(character_name)
+        user_id, old_name = await resolve_character_input(interaction, character_name)
         new_name = (new_name or "").strip()
         if not new_name:
             raise ValueError("New name is required.")
@@ -1541,7 +1588,7 @@ async def award_legacy_points(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         if positive == 0 and negative == 0:
@@ -1582,7 +1629,7 @@ async def convert_star(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(
@@ -1649,7 +1696,7 @@ async def reset_points(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(
@@ -1689,7 +1736,7 @@ async def reset_stars(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
         await run_db(
@@ -1726,7 +1773,7 @@ async def add_ability(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
         ability_name = ability_name.strip()
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
@@ -1756,7 +1803,7 @@ async def upgrade_ability(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
         ability_name = ability_name.strip()
 
         await run_db(require_character(interaction.client.db, interaction.guild.id, user_id, character_name), "require_character")
@@ -1798,7 +1845,7 @@ async def char_card(
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        user_id, character_name = parse_character_key(character_name)
+        user_id, character_name = await resolve_character_input(interaction, character_name)
 
         member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
         if user_id != interaction.user.id and not (member and is_staff(member)):
