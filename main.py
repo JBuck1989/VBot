@@ -1,4 +1,4 @@
-# VB_v51 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v79 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -549,6 +549,59 @@ class Database:
             (guild_id, user_id),
         )
         return [str(r["name"]) for r in rows if r and r.get("name")]
+
+    async def list_all_characters_for_guild(
+        self,
+        guild_id: int,
+        *,
+        include_archived: bool = True,
+        name_filter: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Return characters in a guild with owning user_id.
+
+        Used for staff-only global pickers (archive/delete). Identification remains the
+        existing composite key: (guild_id, user_id, name).
+
+        name_filter is a case-insensitive substring filter applied to name.
+        """
+        where = ["guild_id=%s"]
+        params: List[Any] = [guild_id]
+
+        if not include_archived:
+            where.append("COALESCE(archived, FALSE)=FALSE")
+
+        if name_filter:
+            where.append("name ILIKE %s")
+            params.append(f"%{name_filter}%")
+
+        sql = f"""
+            SELECT user_id, name, COALESCE(archived, FALSE) AS archived, created_at
+            FROM characters
+            WHERE {' AND '.join(where)}
+            ORDER BY COALESCE(archived, FALSE) ASC, created_at ASC, name ASC
+            LIMIT %s;
+        """
+
+        params.append(int(limit))
+        rows = await self._fetchall(sql, tuple(params))
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if not r:
+                continue
+            uid = r.get("user_id")
+            nm = r.get("name")
+            if uid is None or not nm:
+                continue
+            out.append(
+                {
+                    "user_id": int(uid),
+                    "name": str(nm),
+                    "archived": bool(r.get("archived", False)),
+                    "created_at": r.get("created_at"),
+                }
+            )
+        return out
 
     async def list_player_ids(self, guild_id: int) -> List[int]:
         rows = await self._fetchall(
@@ -1194,6 +1247,101 @@ async def require_character(db: Database, guild_id: int, user_id: int, name: str
         raise ValueError("Character not found for that user.")
 
 
+
+# -----------------------------
+# Autocomplete helpers
+# -----------------------------
+
+async def character_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete character names from the DB.
+
+    Behavior:
+    - If the command includes a `user` option, suggestions are for that user.
+    - If the command includes a `user_id` option, suggestions are for that user_id.
+    - Otherwise, suggestions are for the invoking user.
+    """
+    try:
+        if interaction.guild is None:
+            return []
+
+        ns = getattr(interaction, "namespace", None)
+        target_user_id: Optional[int] = None
+
+        # Prefer a selected `user` (discord.Member) if present in the command options
+        if ns is not None:
+            u = getattr(ns, "user", None)
+            if u is not None:
+                target_user_id = int(getattr(u, "id", 0) or 0)
+
+            # Some commands use a raw user_id string
+            if not target_user_id:
+                raw_uid = getattr(ns, "user_id", None)
+                if raw_uid:
+                    try:
+                        target_user_id = int(str(raw_uid).strip())
+                    except Exception:
+                        target_user_id = None
+
+        if not target_user_id:
+            target_user_id = int(interaction.user.id)
+
+        names = await interaction.client.db.list_characters(interaction.guild.id, target_user_id)
+
+        cur = (current or "").strip().lower()
+        if cur:
+            names = [n for n in names if cur in n.lower()]
+
+        # Discord allows up to 25 suggestions.
+        names = names[:25]
+        return [app_commands.Choice(name=n, value=n) for n in names]
+    except Exception:
+        LOG.exception("character_name_autocomplete failed")
+        return []
+
+
+async def character_key_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Staff-only autocomplete for *any* character in the guild.
+
+    Returns a stable composite key value: "<user_id>|<character_name>".
+    """
+    try:
+        if interaction.guild is None:
+            return []
+
+        client = interaction.client
+        db = getattr(client, "db", None)
+        if db is None:
+            return []
+
+        # Pull a limited set from DB filtered by name substring
+        rows = await db.list_all_characters_for_guild(
+            int(interaction.guild.id),
+            include_archived=True,
+            name_filter=str(current or "").strip() or None,
+            limit=200,
+        )
+
+        choices: List[app_commands.Choice[str]] = []
+        for r in rows:
+            uid = int(r["user_id"])
+            name = str(r["name"])
+            archived = bool(r.get("archived", False))
+
+            # Label is user-friendly; value is machine key
+            label = f"{name} — {uid}" + (" (archived)" if archived else "")
+            value = f"{uid}|{name}"
+
+            # Discord limits: name <= 100 chars, value <= 100 chars
+            choices.append(app_commands.Choice(name=label[:100], value=value[:100]))
+
+            if len(choices) >= 25:
+                break
+
+        return choices
+    except Exception:
+        LOG.exception("character_key_autocomplete failed")
+        return []
+
 # -----------------------------
 # Slash commands
 # -----------------------------
@@ -1223,6 +1371,7 @@ async def set_server_rank(interaction: discord.Interaction, user: discord.Member
 @staff_only
 @app_commands.describe(user="The player who owns the character", character_name="Exact character name", kingdom="New home kingdom")
 @app_commands.choices(kingdom=[app_commands.Choice(name=k, value=k) for k in KINGDOMS])
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def set_char_kingdom(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1293,7 +1442,7 @@ async def _add_character_impl(
         await interaction.followup.send(f"❌ Add character failed: {e}", ephemeral=True)
         return
     except Exception:
-        logger.exception("add_character failed")
+        LOG.exception("add_character failed")
         await interaction.followup.send("❌ Add character failed due to an unexpected error.", ephemeral=True)
         return
 
@@ -1301,7 +1450,7 @@ async def _add_character_impl(
     try:
         await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
     except Exception:
-        logger.exception("Dashboard update failed after add_character")
+        LOG.exception("Dashboard update failed after add_character")
 
     await interaction.followup.send(
         f"✅ Added **{character_name}** for {user.mention} (Kingdom: **{kingdom_value}**).",
@@ -1336,6 +1485,7 @@ async def add_character(
     app_commands.Choice(name="Archive", value="archive"),
     app_commands.Choice(name="Unarchive", value="unarchive"),
 ])
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def character_archive(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1372,6 +1522,7 @@ async def character_archive(
 @app_commands.command(name="character_delete", description="(Staff) Delete a character (cannot be undone).")
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def character_delete(interaction: discord.Interaction, user: discord.Member, character_name: str):
     await defer_ephemeral(interaction)
     try:
@@ -1409,6 +1560,7 @@ async def character_delete(interaction: discord.Interaction, user: discord.Membe
         app_commands.Choice(name="Unarchive", value="unarchive"),
     ]
 )
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def character_archive_by_id(
     interaction: discord.Interaction,
     user_id: str,
@@ -1453,6 +1605,7 @@ async def character_archive_by_id(
 @app_commands.command(name="award_legacy_points", description="(Staff) Award positive and/or negative legacy points to a character.")
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def award_legacy_points(interaction: discord.Interaction, user: discord.Member, character_name: str, positive: int = 0, negative: int = 0):
     await defer_ephemeral(interaction)
     try:
@@ -1484,7 +1637,7 @@ async def _handle_convert_star_interaction(
     spend_positive: int,
     spend_negative: int,
 ) -> None:
-    """Shared implementation for /convert_star and /convert_points_to_stars."""
+    """Shared implementation for /convert_star and (removed) /convert_points_to_stars."""
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
@@ -1525,6 +1678,7 @@ async def _handle_convert_star_interaction(
 ])
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def convert_star(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1544,6 +1698,7 @@ async def convert_star(
 ])
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def convert_points_to_stars(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1566,11 +1721,11 @@ async def staff_commands(interaction: discord.Interaction):
     items: list[tuple[str, str]] = [
         ("/add_character", "Add a new character for a player."),
         ("/character_archive", "Archive or unarchive a character (hide/show on the dashboard)."),
-        ("/character_archive_by_id", "Archive/unarchive by user ID (for players who left the server)."),
+        ("(removed) /character_archive_by_id", "Archive/unarchive by user ID (for players who left the server)."),
         ("/award_points", "Award legacy points to a character (positive or negative)."),
         ("/add_ability", "Add a new ability to a character (does not spend stars)."),
         ("/upgrade_ability", "Upgrade an existing ability (costs legacy points; max 5 upgrades)."),
-        ("/convert_points_to_stars", "Convert available legacy points into stars (ability or influence)."),
+        ("(removed) /convert_points_to_stars", "Convert available legacy points into stars (ability or influence)."),
         ("/refresh_dashboard", "Force-refresh a player’s dashboard post right now."),
         ("/char_card", "Show a character card (ephemeral) exactly like the dashboard view."),
     ]
@@ -1584,6 +1739,7 @@ async def staff_commands(interaction: discord.Interaction):
 @app_commands.command(name="reset_points", description="(Staff) Set legacy/lifetime totals for a character (use for corrections).")
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def reset_points(interaction: discord.Interaction, user: discord.Member, character_name: str,
                        legacy_plus: Optional[int] = None, legacy_minus: Optional[int] = None,
                        lifetime_plus: Optional[int] = None, lifetime_minus: Optional[int] = None):
@@ -1604,6 +1760,7 @@ async def reset_points(interaction: discord.Interaction, user: discord.Member, c
 @app_commands.command(name="reset_stars", description="(Staff) Set ability stars and/or influence stars for a character.")
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def reset_stars(interaction: discord.Interaction, user: discord.Member, character_name: str,
                       ability_stars: Optional[int] = None, influence_plus: Optional[int] = None, influence_minus: Optional[int] = None):
     await defer_ephemeral(interaction)
@@ -1623,6 +1780,7 @@ async def reset_stars(interaction: discord.Interaction, user: discord.Member, ch
 @app_commands.command(name="add_ability", description="(Staff) Add an ability to a character (capacity = 2 + ability stars).")
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def add_ability(interaction: discord.Interaction, user: discord.Member, character_name: str, ability_name: str):
     await defer_ephemeral(interaction)
     try:
@@ -1643,6 +1801,7 @@ async def add_ability(interaction: discord.Interaction, user: discord.Member, ch
 @app_commands.command(name="upgrade_ability", description="(Staff) Spend 5 legacy points per upgrade (max 5 upgrades per ability). Requires explicit +/− split.")
 @in_guild_only()
 @staff_only
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def upgrade_ability(
     interaction: discord.Interaction,
     user: discord.Member,
@@ -1707,6 +1866,7 @@ async def refresh_dashboard(interaction: discord.Interaction):
 
 @app_commands.command(name="char_card", description="Show a character card ephemerally.")
 @in_guild_only()
+@app_commands.autocomplete(character_name=character_name_autocomplete)
 async def char_card(interaction: discord.Interaction, character_name: str, user: Optional[discord.Member] = None):
     await defer_ephemeral(interaction)
     try:
@@ -1810,53 +1970,19 @@ class VilyraBotClient(discord.Client):
         # Sync commands
         try:
             gid = safe_int(os.getenv("GUILD_ID"), 0)
-            if gid:
-                guild_obj = discord.Object(id=gid)
-
-                # Fast guild sync (final authoritative wipe+sync happens in on_ready)
-                synced = await self.tree.sync(guild=guild_obj)
-                LOG.info("Guild sync succeeded: %s commands", len(synced))
-
-                if len(synced)==0:
-                    LOG.warning("Guild sync returned 0 commands; attempting global sync fallback...")
-                    try:
-                        synced2 = await self.tree.sync()
-                        LOG.info("Global sync fallback succeeded: %s commands", len(synced2))
-                        try:
-                            # As a last resort, clear guild commands and re-sync to resolve "outdated" command schemas.
-                            self.tree.clear_commands(guild=discord.Object(id=gid))
-                            self.tree.copy_global_to(guild=discord.Object(id=gid))
-                            synced3 = await self.tree.sync(guild=discord.Object(id=gid))
-                            LOG.info("Guild re-sync after clear succeeded: %s commands", len(synced3))
-                        except Exception as ex3:
-                            LOG.warning("Guild re-sync after clear failed: %s", ex3)
-                    except Exception as ex2:
-                        LOG.exception("Global sync fallback failed: %s", ex2)
-                if len(synced)==0:
-                    LOG.warning("Guild sync returned 0 commands. Check GUILD_ID, bot invite scopes (applications.commands), and that commands are not pending global propagation.")
-            else:
-                synced = await self.tree.sync()
-                LOG.info("Global sync succeeded: %s commands", len(synced))
-                if len(synced)==0:
-                    LOG.warning("Global sync returned 0 commands. This can be normal if no changes were detected, but if commands are missing, check bot invite scopes and app command permissions.")
-        except Exception:
-            LOG.exception("Command sync failed")
-
-    async def on_ready(self) -> None:
-        LOG.info("Logged in as %s (ID: %s)", self.user, self.user.id if self.user else "unknown")
-
-        # One-time hard reset of guild commands to eliminate Discord-side signature mismatches.
-        # This fixes cases where Discord still has an older schema and interactions fail with CommandSignatureMismatch.
-        if not getattr(self, "_did_hard_sync", False):
-            try:
-                gid = safe_int(os.getenv("GUILD_ID"), 0)
-                if gid and getattr(self, "application_id", None):
-                    await self.http.bulk_upsert_guild_commands(self.application_id, gid, [])
+            if gid and getattr(self, "application_id", None):
+                if allowed_guild_ids and gid not in allowed_guild_ids:
+                    LOG.error("GUILD_ID %s is not in ALLOWED_GUILD_IDS; skipping guild sync/reset.", gid)
+                else:
+                    allow_reset = (os.getenv("ALLOW_COMMAND_RESET") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+                    if allow_reset:
+                        await self.http.bulk_upsert_guild_commands(self.application_id, gid, [])
+                        LOG.warning("Performed hard guild command reset (ALLOW_COMMAND_RESET=true) for guild %s", gid)
                     synced = await self.tree.sync(guild=discord.Object(id=gid))
-                    LOG.info("Hard guild command sync complete: %s commands", len(synced))
-            except Exception:
-                LOG.exception("Hard guild command sync failed")
-            self._did_hard_sync = True
+                    LOG.info("Guild command sync complete: %s commands (hard_reset=%s)", len(synced), allow_reset)
+        except Exception:
+            LOG.exception("Hard guild command sync failed")
+        self._did_hard_sync = True
 
         LOG.info("Startup dashboard refresh: beginning for %d guild(s)...", len(list(self.guilds)))
         for g in list(self.guilds):
@@ -1878,6 +2004,19 @@ async def main_async() -> None:
     db = Database(dsn)
     await db.connect()
     await db.init_schema()
+
+    # Startup validation / logging (helps handoff & prevents silent misconfig)
+    for k in ("GUILD_ID", "DASHBOARD_CHANNEL_ID", "COMMAND_LOG_CHANNEL_ID"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            try:
+                int(v)
+            except Exception:
+                LOG.warning("Env %s should be an integer ID, but got %r", k, v)
+
+    await db.detect_schema()
+    LOG.info("Startup config: GUILD_ID=%s ALLOWED_GUILD_IDS=%s ALLOW_COMMAND_RESET=%s",
+             os.getenv("GUILD_ID"), os.getenv("ALLOWED_GUILD_IDS"), os.getenv("ALLOW_COMMAND_RESET"))
 
     client = VilyraBotClient(db=db)
     try:
