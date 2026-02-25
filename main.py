@@ -1,4 +1,4 @@
-# VB_v98 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v99 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -1419,23 +1419,37 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
 # Command guards
 # -----------------------------
 
-def in_guild_only():
+def in_guild_only(func=None):
+    """Decorator: command must be used in a guild. Supports @in_guild_only and @in_guild_only()."""
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
             await safe_reply(interaction, "This command can only be used in a server.")
             return False
         return True
-    return app_commands.check(predicate)
+
+    decorator = app_commands.check(predicate)
+    if callable(func):
+        return decorator(func)
+
+    def wrapper(f):
+        return decorator(f)
+
+    return wrapper
 
 
-def staff_only():
+def staff_only(func=None):
     """Decorator: restrict command to server staff/admin.
+
+    Supports both usages:
+      - @staff_only
+      - @staff_only()
 
     Policy:
     - Always requires guild context.
     - Allows if user is guild owner OR has Administrator OR Manage Guild permission.
     - Optional allowlist via STAFF_USER_IDS env var (comma-separated Discord user IDs).
     """
+
     staff_user_ids: set[int] = set()
     raw = os.getenv("STAFF_USER_IDS", "") or ""
     for part in raw.split(","):
@@ -1468,7 +1482,17 @@ def staff_only():
         await safe_reply(interaction, "You don't have permission to use this command.")
         return False
 
-    return app_commands.check(predicate)
+    decorator = app_commands.check(predicate)
+
+    # If used as @staff_only without parentheses, func will be the wrapped function.
+    if callable(func):
+        return decorator(func)
+
+    # Used as @staff_only()
+    def wrapper(f):
+        return decorator(f)
+
+    return wrapper
 
 
 
