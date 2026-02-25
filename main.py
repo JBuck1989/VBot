@@ -1,4 +1,4 @@
-# VB_v92 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v93 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -78,6 +78,14 @@ CHAR_HEADER_RIGHT = " ٭⊹•꧂"
 
 
 LOG = logging.getLogger("VilyraBot")
+
+REQUIRED_DB_METHODS = [
+    "list_player_ids",
+    "list_character_owner_ids",
+    "list_characters",
+    "list_all_characters_for_guild",
+]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] VilyraBot: %(message)s")
 
 
@@ -1945,6 +1953,15 @@ async def _legacy_list_all_characters_for_guild(
     params.append(int(limit))
     rows = await self._fetchall(q, tuple(params))
     return [dict(r) for r in rows]
+
+
+async def list_character_owner_ids(self, guild_id: int) -> List[int]:
+    """Fallback: distinct user_ids present in characters for this guild."""
+    rows = await self._fetchall(
+        "SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC",
+        (guild_id,),
+    )
+    return [int(r["user_id"]) for r in rows]
 
 class VilyraBotClient(discord.Client):
     """Main Discord client wrapper.
