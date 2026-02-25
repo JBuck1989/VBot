@@ -1,4 +1,4 @@
-# VB_v94 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
+# VB_v95 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT (self-check fixed to actual DB API; stable; no destructive DB ops)
 # (self-check added; no destructive DB ops)
 
 from __future__ import annotations
@@ -389,6 +389,10 @@ def __getattr__(self, name: str):
         return self._compat_list_all_characters_for_guild
     if name == "list_character_owner_ids":
         return self._compat_list_character_owner_ids
+        if name == "connect":
+            return self._compat_connect
+        if name == "close":
+            return self._compat_close
     raise AttributeError(f"{type(self).__name__!s} object has no attribute {name}")
 
 async def _compat_list_player_ids(self, guild_id: int) -> List[int]:
@@ -2182,7 +2186,7 @@ async def main_async() -> None:
     dsn = env("DATABASE_URL")
 
     db = Database(dsn)
-    await db.connect()
+    await getattr(db, 'connect')()
     await db.init_schema()
 
     client = VilyraBotClient(db=db)
