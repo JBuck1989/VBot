@@ -73,7 +73,7 @@ REP_MAX = 100
 DASHBOARD_TEMPLATE_VERSION = 1
 
 # Throttle dashboard edits
-DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "1.2"))
+DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "3.0"))
 PLAYER_POST_SOFT_LIMIT = 1900
 
 BORDER_LEN = 20
@@ -1115,6 +1115,11 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
         except Exception:
             msg = None
 
+
+    # If nothing about the rendered content changed, do NOT edit the message.
+    # This is the single biggest lever to avoid Discord PATCH rate limits at startup.
+    if msg is not None and stored_hash == new_hash and stored_tv == DASHBOARD_TEMPLATE_VERSION:
+        return "skipped"
     if msg is None:
         await client.dashboard_limiter.wait()
         msg = await channel.send(content)
@@ -1149,7 +1154,7 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
         try:
             await refresh_player_dashboard(client, guild, uid)
             ok += 1
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1.0)
         except Exception:
             LOG.exception("Failed refreshing dashboard for uid=%s", uid)
     return f"Refreshed dashboards for {ok} player(s)."
