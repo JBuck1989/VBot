@@ -1,4 +1,4 @@
-# VB_v104 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT
+# VB_v107 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT
 # Goals (v104):
 # - All commands ephemeral
 # - Log ALL commands to #Legacy-Commands-Log (except /char_card)
@@ -1564,6 +1564,12 @@ class VilyraBotClient(discord.Client):
                 LOG.error("GUILD_ID %s not in ALLOWED_GUILD_IDS; skipping sync/reset.", gid)
                 return
 
+            allow_global_reset = (os.getenv("ALLOW_GLOBAL_COMMAND_RESET") or "").strip().lower() in ("1","true","yes","y","on")
+            if allow_global_reset:
+                # Wipe ALL GLOBAL application commands for this bot (removes stale/duplicate globals).
+                # This is safe for your DB. It only affects what commands Discord shows.
+                await self.http.bulk_upsert_global_commands(self.application_id, [])
+                LOG.warning("Performed GLOBAL application command reset (ALLOW_GLOBAL_COMMAND_RESET=true)")
             allow_reset = (os.getenv("ALLOW_COMMAND_RESET") or "").strip().lower() in ("1", "true", "yes", "y", "on")
             guild_obj = discord.Object(id=gid)
             self.tree.copy_global_to(guild=guild_obj)
