@@ -1,4 +1,4 @@
-# VB_v107 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT
+# VB_v108 — Vilyra Legacy Bot (Railway + Postgres) — FULL REPLACEMENT
 # Goals (v104):
 # - All commands ephemeral
 # - Log ALL commands to #Legacy-Commands-Log (except /char_card)
@@ -572,20 +572,20 @@ class Database:
         return str(row["server_rank"]) if row and row.get("server_rank") else "Newcomer"
 
 
-async def set_player_rank(self, guild_id: int, user_id: int, rank: str) -> None:
-    """Set a player's server rank (validated)."""
-    rank = (rank or "").strip()
-    if rank not in SERVER_RANKS:
-        raise ValueError("Invalid rank.")
-    await self._execute(
-        """
-        INSERT INTO players (guild_id, user_id, server_rank)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (guild_id, user_id)
-        DO UPDATE SET server_rank=EXCLUDED.server_rank, updated_at=NOW();
-        """,
-        (guild_id, user_id, rank),
-    )
+    async def set_player_rank(self, guild_id: int, user_id: int, rank: str) -> None:
+        """Set a player's server rank (validated)."""
+        rank = (rank or "").strip()
+        if rank not in SERVER_RANKS:
+            raise ValueError("Invalid rank.")
+        await self._execute(
+            """
+            INSERT INTO players (guild_id, user_id, server_rank)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET server_rank=EXCLUDED.server_rank, updated_at=NOW();
+            """,
+            (guild_id, user_id, rank),
+        )
 # -------- Legacy points --------
 
     async def award_legacy(self, guild_id: int, character_id: int, pos: int, neg: int) -> None:
