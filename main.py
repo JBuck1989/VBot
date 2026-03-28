@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import asyncio
 import hashlib
@@ -1261,13 +1259,20 @@ def in_guild_only(func=None):
         return decorator(f)
     return wrapper
 
+def _parse_env_id_set(*names: str) -> set[int]:
+    out: set[int] = set()
+    for name in names:
+        raw = os.getenv(name, "") or ""
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                out.add(int(part))
+    return out
+
+
 def staff_only(func=None):
-    staff_user_ids: set[int] = set()
-    raw = os.getenv("STAFF_USER_IDS", "") or ""
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            staff_user_ids.add(int(part))
+    staff_user_ids = _parse_env_id_set("STAFF_USER_IDS")
+    staff_role_ids = _parse_env_id_set("STAFF_ROLES_IDS", "STAFF_ROLE_IDS")
 
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -1283,6 +1288,8 @@ def staff_only(func=None):
         if interaction.guild.owner_id == interaction.user.id:
             return True
         if isinstance(member, discord.Member):
+            if staff_role_ids and any(role.id in staff_role_ids for role in member.roles):
+                return True
             perms = member.guild_permissions
             if perms.administrator or perms.manage_guild:
                 return True
