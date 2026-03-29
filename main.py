@@ -38,9 +38,15 @@ REP_MIN = -100
 REP_MAX = 100
 
 DASHBOARD_TEMPLATE_VERSION = 6
-DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "2.5"))
-NAV_REBUILD_DEBOUNCE_SECONDS = float(os.getenv("NAV_REBUILD_DEBOUNCE_SECONDS", "12.0"))
+DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "3.0"))
 PLAYER_POST_SOFT_LIMIT = 1900
+
+NAV_REBUILD_DEBOUNCE_SECONDS = float(os.getenv("NAV_REBUILD_DEBOUNCE_SECONDS", "12.0"))
+BOOTSTRAP_PLAYER_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_PLAYER_PAUSE_SECONDS", "3.0"))
+BOOTSTRAP_BATCH_SIZE = max(1, int(os.getenv("BOOTSTRAP_BATCH_SIZE", "10")))
+BOOTSTRAP_BATCH_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_BATCH_PAUSE_SECONDS", "8.0"))
+BOOTSTRAP_NAV_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_NAV_PAUSE_SECONDS", "10.0"))
+MAINTENANCE_PLAYER_PAUSE_SECONDS = float(os.getenv("MAINTENANCE_PLAYER_PAUSE_SECONDS", "1.0"))
 
 SERVER_RANKS = [
     "Newcomer",
@@ -59,6 +65,11 @@ RANK_CHOICES: List[app_commands.Choice[str]] = [app_commands.Choice(name=r, valu
 KINGDOMS: List[str] = ["Velarith", "Lyvik", "Baelon", "Sethrathiel", "Avalea"]
 KINGDOM_CHOICES: List[app_commands.Choice[str]] = [app_commands.Choice(name=k, value=k) for k in KINGDOMS]
 
+REFRESH_MODE_CHOICES: List[app_commands.Choice[str]] = [
+    app_commands.Choice(name="Initialize (slow full rebuild)", value="initialize"),
+    app_commands.Choice(name="Maintenance (lighter full upkeep)", value="maintenance"),
+]
+
 BORDER_LEN = 16
 PLAYER_BORDER = "═" * BORDER_LEN
 CHAR_SEPARATOR = "─" * BORDER_LEN
@@ -71,13 +82,11 @@ DASHBOARD_SPLIT_MARKER = "\n\n<<POST_SPLIT>>\n\n"
 # Helpers
 # -----------------------------
 
-
 def env(name: str) -> str:
     v = os.getenv(name)
     if not v:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return v
-
 
 def safe_int(v: Any, default: int = 0) -> int:
     try:
@@ -87,25 +96,20 @@ def safe_int(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
-
 def clamp(n: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, n))
-
 
 def content_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
-
 def db_timeout() -> float:
     return float(os.getenv("DB_TIMEOUT", "8.0"))
-
 
 async def run_db(coro, label: str):
     try:
         return await asyncio.wait_for(coro, timeout=db_timeout())
     except asyncio.TimeoutError as e:
         raise RuntimeError(f"Database operation timed out ({label}).") from e
-
 
 async def safe_reply(interaction: discord.Interaction, content: str, *, embed: discord.Embed | None = None) -> None:
     try:
@@ -116,7 +120,6 @@ async def safe_reply(interaction: discord.Interaction, content: str, *, embed: d
     except Exception:
         LOG.exception("Failed to send response/followup")
 
-
 async def defer_ephemeral(interaction: discord.Interaction) -> None:
     try:
         if not interaction.response.is_done():
@@ -124,36 +127,29 @@ async def defer_ephemeral(interaction: discord.Interaction) -> None:
     except Exception:
         pass
 
-
 async def send_error(interaction: discord.Interaction, error: Exception | str) -> None:
-    await safe_reply(interaction, f"❌ {str(error)}")
-
+    msg = str(error)
+    await safe_reply(interaction, f"❌ {msg}")
 
 def normalize_channel_name(name: str) -> str:
     return (name or "").strip().lower()
 
-
-def build_message_link(guild_id: int, channel_id: int, message_id: int) -> str:
-    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
-
-
 def embed_hash(embed: discord.Embed) -> str:
     parts: List[str] = [
-        str(embed.title or ""),
-        str(embed.description or ""),
-        str(embed.footer.text if embed.footer else ""),
+        embed.title or "",
+        embed.description or "",
+        str(embed.color.value if embed.color else 0),
+        embed.footer.text if embed.footer else "",
+        embed.author.name if embed.author else "",
     ]
     for field in embed.fields:
-        parts.append(str(field.name or ""))
-        parts.append(str(field.value or ""))
-        parts.append("1" if field.inline else "0")
+        parts.extend([field.name or "", field.value or "", "1" if field.inline else "0"])
     return content_hash("\n".join(parts))
 
 
 # -----------------------------
 # Rate limiter for dashboard edits
 # -----------------------------
-
 
 class SimpleRateLimiter:
     def __init__(self, min_interval: float = 1.0):
@@ -176,11 +172,9 @@ class SimpleRateLimiter:
 # UI renderers
 # -----------------------------
 
-
 def render_ability_star_bar(n: int) -> str:
     n = clamp(int(n), 0, MAX_ABILITY_STARS)
     return "★" * n + "☆" * (MAX_ABILITY_STARS - n)
-
 
 def render_influence_star_bar(neg: int, pos: int) -> str:
     neg = clamp(int(neg), 0, MAX_INFL_STARS_TOTAL)
@@ -192,7 +186,6 @@ def render_influence_star_bar(neg: int, pos: int) -> str:
     for i in range(pos):
         pos_slots[i] = "★"
     return "- " + "".join(neg_slots) + " | " + "".join(pos_slots) + " +"
-
 
 def render_reputation_block(net_lifetime: int) -> str:
     net = clamp(int(net_lifetime), REP_MIN, REP_MAX)
@@ -212,7 +205,6 @@ def render_reputation_block(net_lifetime: int) -> str:
     explainer = left_text + (" " * spaces) + right_text
     return explainer + "\n" + bar_line
 
-
 def dashboard_header(display: str, rank: str, *, continued: bool) -> List[str]:
     label = f"{display} (cont.)" if continued else display
     return [
@@ -227,11 +219,11 @@ def dashboard_header(display: str, rank: str, *, continued: bool) -> List[str]:
 # Database layer
 # -----------------------------
 
-
 class Database:
     def __init__(self, dsn: str):
         self._dsn = dsn
         self._conn: Optional[psycopg.AsyncConnection] = None
+
         self.characters_cols: set[str] = set()
         self.abilities_cols: set[str] = set()
         self.abilities_level_col: str = "upgrade_level"
@@ -1072,6 +1064,9 @@ class Database:
     async def clear_dashboard_entry(self, guild_id: int, user_id: int) -> None:
         await self._execute("DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
 
+    async def clear_dashboard_entries_for_guild(self, guild_id: int) -> None:
+        await self._execute("DELETE FROM dashboard_messages WHERE guild_id=%s;", (guild_id,))
+
     async def get_dashboard_meta(self, guild_id: int) -> Dict[str, Any]:
         row = await self._fetchone(
             """
@@ -1110,11 +1105,13 @@ class Database:
             (guild_id, channel_id, leaderboard_message_id, quicklinks_message_id, leaderboard_hash, quicklinks_hash),
         )
 
+    async def clear_dashboard_meta(self, guild_id: int) -> None:
+        await self._execute("DELETE FROM dashboard_channel_meta WHERE guild_id=%s;", (guild_id,))
+
 
 # -----------------------------
 # Character dashboard rendering
 # -----------------------------
-
 
 @dataclass
 class CharacterCard:
@@ -1132,7 +1129,6 @@ class CharacterCard:
     infl_minus: int
     abilities: List[Tuple[str, int]]
     tourney_laurels: List[str]
-
 
 async def build_character_card(db: Database, guild_id: int, character_id: int) -> CharacterCard:
     st = await db.get_character_state(guild_id, character_id)
@@ -1156,28 +1152,33 @@ async def build_character_card(db: Database, guild_id: int, character_id: int) -
         tourney_laurels=tourney_laurels,
     )
 
-
 def render_character_card_block(card: CharacterCard) -> str:
     net_lifetime = card.lifetime_plus - card.lifetime_minus
     lines: List[str] = []
     lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
     k = (card.kingdom or "").strip()
     lines.append(f"Kingdom: {k}" if k else "Kingdom:")
-    lines.append("Noble Titles: " + " | ".join(card.noble_titles) if card.noble_titles else "Noble Titles:")
+    if card.noble_titles:
+        lines.append("Noble Titles: " + " | ".join(card.noble_titles))
+    else:
+        lines.append("Noble Titles:")
     lines.append("")
     lines.append(f"Legacy Points: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
     lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
     lines.append("Influence Stars: " + render_influence_star_bar(card.infl_minus, card.infl_plus))
     lines.append(render_reputation_block(net_lifetime))
     if card.abilities:
-        lines.append("Abilities: " + " | ".join(f"{nm} ({lvl})" for nm, lvl in card.abilities))
+        parts = [f"{nm} ({lvl})" for nm, lvl in card.abilities]
+        lines.append("Abilities: " + " | ".join(parts))
     else:
         lines.append("Abilities: _none set_")
     lines.append("")
     lines.append("__Tourney Laurels__")
-    lines.extend(card.tourney_laurels or ["None yet"])
+    if card.tourney_laurels:
+        lines.extend(card.tourney_laurels)
+    else:
+        lines.append("None yet")
     return "\n".join(lines).strip()
-
 
 def render_dashboard_character_block(card: CharacterCard) -> str:
     net_lifetime = card.lifetime_plus - card.lifetime_minus
@@ -1185,19 +1186,25 @@ def render_dashboard_character_block(card: CharacterCard) -> str:
     lines.append(f"◆ **{card.name}**")
     k = (card.kingdom or "").strip()
     lines.append(f"Kingdom: {k}" if k else "Kingdom:")
-    lines.append("Noble Titles: " + " | ".join(card.noble_titles) if card.noble_titles else "Noble Titles:")
+    if card.noble_titles:
+        lines.append("Noble Titles: " + " | ".join(card.noble_titles))
+    else:
+        lines.append("Noble Titles:")
     lines.append(f"Legacy: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
     lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
     lines.append("Influence Stars: " + render_influence_star_bar(card.infl_minus, card.infl_plus))
     lines.append(render_reputation_block(net_lifetime))
     if card.abilities:
-        lines.append("Abilities: " + " | ".join(f"{nm} ({lvl})" for nm, lvl in card.abilities))
+        parts = [f"{nm} ({lvl})" for nm, lvl in card.abilities]
+        lines.append("Abilities: " + " | ".join(parts))
     else:
         lines.append("Abilities: _none set_")
     lines.append("__Tourney Laurels__")
-    lines.extend(card.tourney_laurels or ["None yet"])
+    if card.tourney_laurels:
+        lines.extend(card.tourney_laurels)
+    else:
+        lines.append("None yet")
     return "\n".join(lines).strip()
-
 
 async def render_player_posts(db: Database, guild: discord.Guild, user_id: int) -> List[str]:
     member = guild.get_member(user_id)
@@ -1228,7 +1235,8 @@ async def render_player_posts(db: Database, guild: discord.Guild, user_id: int) 
             current_lines = dashboard_header(display, rank, continued=True)
             current_len = len("\n".join(current_lines))
             piece_lines = [block]
-            projected = current_len + len("\n" + block)
+            piece_text = block
+            projected = current_len + len("\n" + piece_text)
 
         if projected > PLAYER_POST_SOFT_LIMIT and len(current_lines) == 4:
             LOG.warning("Single character block for user_id=%s exceeds soft dashboard limit; sending anyway.", user_id)
@@ -1238,7 +1246,6 @@ async def render_player_posts(db: Database, guild: discord.Guild, user_id: int) 
 
     posts.append("\n".join(current_lines).rstrip())
     return posts
-
 
 async def get_dashboard_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     ch_id = safe_int(os.getenv("DASHBOARD_CHANNEL_ID"), DEFAULT_DASHBOARD_CHANNEL_ID)
@@ -1255,7 +1262,6 @@ async def get_dashboard_channel(guild: discord.Guild) -> Optional[discord.TextCh
 # Command logging channel
 # -----------------------------
 
-
 async def get_command_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     target = normalize_channel_name(COMMAND_LOG_CHANNEL_NAME)
     for ch in guild.text_channels:
@@ -1270,7 +1276,6 @@ async def get_command_log_channel(guild: discord.Guild) -> Optional[discord.Text
         except Exception:
             ch = None
     return ch if isinstance(ch, discord.TextChannel) else None
-
 
 async def log_command(interaction: discord.Interaction, text: str) -> None:
     guild = interaction.guild
@@ -1288,7 +1293,6 @@ async def log_command(interaction: discord.Interaction, text: str) -> None:
 # -----------------------------
 # Autocomplete + resolvers
 # -----------------------------
-
 
 async def autocomplete_character(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     try:
@@ -1317,7 +1321,6 @@ async def autocomplete_character(interaction: discord.Interaction, current: str)
         LOG.exception("Character autocomplete failed")
         return []
 
-
 async def resolve_character(interaction: discord.Interaction, token: str) -> Tuple[int, Dict[str, Any]]:
     guild = interaction.guild
     if guild is None:
@@ -1335,7 +1338,6 @@ async def resolve_character(interaction: discord.Interaction, token: str) -> Tup
     if not row2:
         raise ValueError("Character not found.")
     return int(row2["character_id"]), row2
-
 
 async def autocomplete_ability(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     try:
@@ -1368,23 +1370,18 @@ async def autocomplete_ability(interaction: discord.Interaction, current: str) -
 # Command guards
 # -----------------------------
 
-
 def in_guild_only(func=None):
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
             await safe_reply(interaction, "This command can only be used in a server.")
             return False
         return True
-
     decorator = app_commands.check(predicate)
     if callable(func):
         return decorator(func)
-
     def wrapper(f):
         return decorator(f)
-
     return wrapper
-
 
 def _parse_env_id_set(*names: str) -> set[int]:
     out: set[int] = set()
@@ -1395,7 +1392,6 @@ def _parse_env_id_set(*names: str) -> set[int]:
             if part.isdigit():
                 out.add(int(part))
     return out
-
 
 def staff_only(func=None):
     staff_user_ids = _parse_env_id_set("STAFF_USER_IDS")
@@ -1426,17 +1422,17 @@ def staff_only(func=None):
     decorator = app_commands.check(predicate)
     if callable(func):
         return decorator(func)
-
     def wrapper(f):
         return decorator(f)
-
     return wrapper
 
 
 # -----------------------------
-# Leaderboards / Quick Links
+# Leaderboards / Links
 # -----------------------------
 
+def build_message_link(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 def _format_leaderboard_lines(rows: List[Dict[str, Any]], value_key: str, *, label: str, limit: int = 10) -> str:
     if not rows:
@@ -1448,64 +1444,50 @@ def _format_leaderboard_lines(rows: List[Dict[str, Any]], value_key: str, *, lab
         lines.append(f"{idx}. {name} - {value} {label}")
     return "\n".join(lines)
 
-
 def render_leaderboard_embed(guild: discord.Guild, rows: List[Dict[str, Any]]) -> discord.Embed:
     influential = sorted(
         rows,
-        key=lambda r: (
-            -safe_int(r.get("total_influence_stars"), 0),
-            -safe_int(r.get("influence_plus"), 0),
-            str(r.get("name") or "").lower(),
-            safe_int(r.get("character_id"), 0),
-        ),
+        key=lambda r: (-safe_int(r.get("total_influence_stars"), 0), -safe_int(r.get("influence_plus"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
     )
     powerful = sorted(
         rows,
-        key=lambda r: (
-            -safe_int(r.get("ability_stars"), 0),
-            -safe_int(r.get("total_ability_upgrades"), 0),
-            str(r.get("name") or "").lower(),
-            safe_int(r.get("character_id"), 0),
-        ),
+        key=lambda r: (-safe_int(r.get("ability_stars"), 0), -safe_int(r.get("total_ability_upgrades"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
     )
-    ability_star_leaders = powerful
+    ability_star_leaders = sorted(
+        rows,
+        key=lambda r: (-safe_int(r.get("ability_stars"), 0), -safe_int(r.get("total_ability_upgrades"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
+    )
     upgraded_leaders = sorted(
         rows,
-        key=lambda r: (
-            -safe_int(r.get("total_ability_upgrades"), 0),
-            -safe_int(r.get("ability_stars"), 0),
-            str(r.get("name") or "").lower(),
-            safe_int(r.get("character_id"), 0),
-        ),
+        key=lambda r: (-safe_int(r.get("total_ability_upgrades"), 0), -safe_int(r.get("ability_stars"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
     )
 
     embed = discord.Embed(
-        title="Legacy Leaderboards",
-        description="Most influential and most powerful characters in the Legacy system.",
+        title="🏆 Legacy Leaderboards",
+        description="A quick look at the most influential and most powerful characters in the Legacy system.",
     )
     embed.add_field(
-        name="Most Influential",
+        name="🌟 Most Influential",
         value=_format_leaderboard_lines(influential, "total_influence_stars", label="influence stars"),
         inline=False,
     )
     embed.add_field(
-        name="Most Powerful",
+        name="⚔️ Most Powerful",
         value=_format_leaderboard_lines(powerful, "ability_stars", label="ability stars"),
         inline=False,
     )
     embed.add_field(
-        name="Most Ability Stars",
+        name="✨ Most Ability Stars",
         value=_format_leaderboard_lines(ability_star_leaders, "ability_stars", label="ability stars"),
         inline=False,
     )
     embed.add_field(
-        name="Most Upgraded Abilities",
+        name="📚 Most Upgraded Abilities",
         value=_format_leaderboard_lines(upgraded_leaders, "total_ability_upgrades", label="total upgrades"),
         inline=False,
     )
     embed.set_footer(text=f"{guild.name} Legacy Dashboard")
     return embed
-
 
 async def render_quicklinks_embed(
     db: Database,
@@ -1513,7 +1495,8 @@ async def render_quicklinks_embed(
     channel_id: int,
     leaderboard_message_id: int,
 ) -> discord.Embed:
-    lines: List[str] = [f"[Leaderboard]({build_message_link(guild.id, channel_id, leaderboard_message_id)})"]
+    lines: List[str] = [f"[🏆 Leaderboard]({build_message_link(guild.id, channel_id, leaderboard_message_id)})"]
+
     user_ids = await db.list_player_ids(guild.id)
     for user_id in user_ids:
         chars = await db.list_characters_for_user(guild.id, user_id, include_archived=False)
@@ -1536,110 +1519,16 @@ async def render_quicklinks_embed(
     if len(description) > 4000:
         description = description[:3950].rstrip() + "\n\n...(truncated)"
     embed = discord.Embed(
-        title="Quick Links",
+        title="🧭 Quick Links",
         description=description or "No dashboard links available yet.",
     )
-    embed.set_footer(text="Jump to leaderboards and character dashboard entries")
+    embed.set_footer(text="Jump to the leaderboard and player dashboard entries")
     return embed
 
 
 # -----------------------------
 # Dashboards
 # -----------------------------
-
-
-async def refresh_dashboard_navigation(
-    client: "VilyraBotClient",
-    guild: discord.Guild,
-    *,
-    force_repost: bool = False,
-) -> str:
-    db = client.db
-    channel = await get_dashboard_channel(guild)
-    if not channel:
-        return "failed"
-
-    me = guild.me or (guild.get_member(client.user.id) if client.user else None)
-    if me:
-        perms = channel.permissions_for(me)
-        if not (perms.view_channel and perms.send_messages and perms.embed_links):
-            return "failed"
-
-    rows = await db.get_leaderboard_rows(guild.id)
-    leaderboard_embed = render_leaderboard_embed(guild, rows)
-    leaderboard_hash = embed_hash(leaderboard_embed)
-
-    meta = await db.get_dashboard_meta(guild.id)
-    leaderboard_id = safe_int(meta.get("leaderboard_message_id"), 0)
-    quicklinks_id = safe_int(meta.get("quicklinks_message_id"), 0)
-    stored_leaderboard_hash = str(meta.get("leaderboard_hash") or "")
-    stored_quicklinks_hash = str(meta.get("quicklinks_hash") or "")
-
-    leaderboard_msg: Optional[discord.Message] = None
-    quicklinks_msg: Optional[discord.Message] = None
-
-    if leaderboard_id:
-        try:
-            leaderboard_msg = await channel.fetch_message(leaderboard_id)
-        except Exception:
-            leaderboard_msg = None
-    if quicklinks_id:
-        try:
-            quicklinks_msg = await channel.fetch_message(quicklinks_id)
-        except Exception:
-            quicklinks_msg = None
-
-    if force_repost or leaderboard_msg is None:
-        await client.dashboard_limiter.wait()
-        new_leaderboard_msg = await channel.send(embed=leaderboard_embed)
-    else:
-        new_leaderboard_msg = leaderboard_msg
-        if leaderboard_hash != stored_leaderboard_hash:
-            await client.dashboard_limiter.wait()
-            await leaderboard_msg.edit(embed=leaderboard_embed)
-
-    quicklinks_embed = await render_quicklinks_embed(db, guild, channel.id, new_leaderboard_msg.id)
-    quicklinks_hash = embed_hash(quicklinks_embed)
-
-    if force_repost or quicklinks_msg is None:
-        await client.dashboard_limiter.wait()
-        new_quicklinks_msg = await channel.send(embed=quicklinks_embed)
-    else:
-        new_quicklinks_msg = quicklinks_msg
-        if quicklinks_hash != stored_quicklinks_hash or new_leaderboard_msg.id != leaderboard_id:
-            await client.dashboard_limiter.wait()
-            await quicklinks_msg.edit(embed=quicklinks_embed)
-
-    if force_repost:
-        for old_id in [leaderboard_id, quicklinks_id]:
-            if old_id and old_id not in {new_leaderboard_msg.id, new_quicklinks_msg.id}:
-                try:
-                    old_msg = await channel.fetch_message(old_id)
-                    await client.dashboard_limiter.wait()
-                    await old_msg.delete()
-                except Exception:
-                    pass
-
-    await db.set_dashboard_meta(
-        guild.id,
-        channel.id,
-        new_leaderboard_msg.id,
-        new_quicklinks_msg.id,
-        leaderboard_hash,
-        quicklinks_hash,
-    )
-
-    if force_repost:
-        return "updated"
-    if (
-        leaderboard_hash == stored_leaderboard_hash
-        and quicklinks_hash == stored_quicklinks_hash
-        and leaderboard_id == new_leaderboard_msg.id
-        and quicklinks_id == new_quicklinks_msg.id
-    ):
-        return "skipped"
-    return "updated"
-
 
 async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Guild, user_id: int) -> str:
     db = client.db
@@ -1712,24 +1601,122 @@ async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Gui
         return "updated"
     return "skipped"
 
+async def _safe_fetch_message(channel: discord.TextChannel, message_id: int) -> Optional[discord.Message]:
+    try:
+        return await channel.fetch_message(message_id)
+    except Exception:
+        return None
 
-async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild) -> str:
-    user_ids = await client.db.list_player_ids(guild.id)
+async def refresh_dashboard_navigation(
+    client: "VilyraBotClient",
+    guild: discord.Guild,
+    *,
+    force_repost: bool,
+    dirty_leaderboard: bool,
+    dirty_quicklinks: bool,
+) -> str:
+    db = client.db
+    channel = await get_dashboard_channel(guild)
+    if not channel:
+        return "failed"
+
+    me = guild.me or (guild.get_member(client.user.id) if client.user else None)
+    if me:
+        perms = channel.permissions_for(me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            return "failed"
+
+    meta = await db.get_dashboard_meta(guild.id)
+    old_leaderboard_id = safe_int(meta.get("leaderboard_message_id"), 0)
+    old_quicklinks_id = safe_int(meta.get("quicklinks_message_id"), 0)
+    old_leaderboard_hash = str(meta.get("leaderboard_hash") or "")
+    old_quicklinks_hash = str(meta.get("quicklinks_hash") or "")
+
+    leaderboard_msg = None if force_repost or not old_leaderboard_id else await _safe_fetch_message(channel, old_leaderboard_id)
+    quicklinks_msg = None if force_repost or not old_quicklinks_id else await _safe_fetch_message(channel, old_quicklinks_id)
+
+    rows = await db.get_leaderboard_rows(guild.id)
+    leaderboard_embed = render_leaderboard_embed(guild, rows)
+    leaderboard_hash = embed_hash(leaderboard_embed)
+
+    if force_repost or leaderboard_msg is None:
+        await client.dashboard_limiter.wait()
+        leaderboard_msg = await channel.send(embed=leaderboard_embed)
+    elif dirty_leaderboard and leaderboard_hash != old_leaderboard_hash:
+        await client.dashboard_limiter.wait()
+        await leaderboard_msg.edit(embed=leaderboard_embed)
+
+    if leaderboard_msg is None:
+        return "failed"
+
+    quicklinks_embed = await render_quicklinks_embed(db, guild, channel.id, leaderboard_msg.id)
+    quicklinks_hash = embed_hash(quicklinks_embed)
+
+    if force_repost or quicklinks_msg is None:
+        await client.dashboard_limiter.wait()
+        quicklinks_msg = await channel.send(embed=quicklinks_embed)
+    elif dirty_quicklinks and quicklinks_hash != old_quicklinks_hash:
+        await client.dashboard_limiter.wait()
+        await quicklinks_msg.edit(embed=quicklinks_embed)
+
+    if force_repost:
+        for old_id in [old_leaderboard_id, old_quicklinks_id]:
+            if old_id:
+                try:
+                    old_msg = await channel.fetch_message(old_id)
+                    await client.dashboard_limiter.wait()
+                    await old_msg.delete()
+                except Exception:
+                    pass
+
+    await db.set_dashboard_meta(
+        guild.id,
+        channel.id,
+        leaderboard_msg.id if leaderboard_msg else None,
+        quicklinks_msg.id if quicklinks_msg else None,
+        leaderboard_hash,
+        quicklinks_hash,
+    )
+    return "updated"
+
+async def run_initialize_refresh(client: "VilyraBotClient", guild: discord.Guild) -> str:
+    db = client.db
+    channel = await get_dashboard_channel(guild)
+    if not channel:
+        return "Initialize failed: dashboard channel not found."
+
+    await db.clear_dashboard_entries_for_guild(guild.id)
+    await db.clear_dashboard_meta(guild.id)
+
+    user_ids = await db.list_player_ids(guild.id)
+    if not user_ids:
+        return "Initialize complete: no players with characters yet."
+
     counts = {"updated": 0, "created": 0, "skipped": 0, "cleared": 0, "failed": 0}
 
-    for uid in user_ids:
+    for idx, uid in enumerate(user_ids, start=1):
         try:
             status = await refresh_player_dashboard(client, guild, uid)
             counts[status if status in counts else "failed"] += 1
-            await asyncio.sleep(0.25)
         except Exception:
-            LOG.exception("refresh_player_dashboard failed for user_id=%s", uid)
+            LOG.exception("initialize refresh_player_dashboard failed for user_id=%s", uid)
             counts["failed"] += 1
-            await asyncio.sleep(0.25)
 
-    nav_status = await refresh_dashboard_navigation(client, guild, force_repost=True)
+        await asyncio.sleep(BOOTSTRAP_PLAYER_PAUSE_SECONDS)
+        if idx % BOOTSTRAP_BATCH_SIZE == 0 and idx < len(user_ids):
+            await asyncio.sleep(BOOTSTRAP_BATCH_PAUSE_SECONDS)
+
+    await asyncio.sleep(BOOTSTRAP_NAV_PAUSE_SECONDS)
+    nav_status = await refresh_dashboard_navigation(
+        client,
+        guild,
+        force_repost=True,
+        dirty_leaderboard=True,
+        dirty_quicklinks=True,
+    )
+
     return (
-        "Queued refresh complete: "
+        "Initialize complete: "
         f"{counts['updated']} updated, "
         f"{counts['created']} created, "
         f"{counts['skipped']} skipped, "
@@ -1738,24 +1725,58 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
         f"Leaderboards/navigation: {nav_status}."
     )
 
+async def run_maintenance_refresh(client: "VilyraBotClient", guild: discord.Guild) -> str:
+    user_ids = await client.db.list_player_ids(guild.id)
+    if not user_ids:
+        return "Maintenance complete: 0 updated, 0 created, 0 skipped, 0 cleared, 0 failed."
 
-async def refresh_player_views(
+    counts = {"updated": 0, "created": 0, "skipped": 0, "cleared": 0, "failed": 0}
+
+    for uid in user_ids:
+        try:
+            status = await refresh_player_dashboard(client, guild, uid)
+            counts[status if status in counts else "failed"] += 1
+        except Exception:
+            LOG.exception("maintenance refresh_player_dashboard failed for user_id=%s", uid)
+            counts["failed"] += 1
+        await asyncio.sleep(MAINTENANCE_PLAYER_PAUSE_SECONDS)
+
+    nav_status = await refresh_dashboard_navigation(
+        client,
+        guild,
+        force_repost=False,
+        dirty_leaderboard=True,
+        dirty_quicklinks=True,
+    )
+
+    return (
+        "Maintenance complete: "
+        f"{counts['updated']} updated, "
+        f"{counts['created']} created, "
+        f"{counts['skipped']} skipped, "
+        f"{counts['cleared']} cleared, "
+        f"{counts['failed']} failed. "
+        f"Leaderboards/navigation: {nav_status}."
+    )
+
+async def refresh_player_and_schedule_nav(
     client: "VilyraBotClient",
     guild: discord.Guild,
     user_id: int,
     *,
-    schedule_nav: bool = False,
+    dirty_leaderboard: bool = False,
+    dirty_quicklinks: bool = False,
 ) -> str:
     status = await refresh_player_dashboard(client, guild, user_id)
-    if schedule_nav:
-        client.schedule_navigation_refresh(guild.id)
+    if dirty_leaderboard or dirty_quicklinks:
+        client.mark_navigation_dirty(guild.id, dirty_leaderboard=dirty_leaderboard, dirty_quicklinks=dirty_quicklinks)
+        client.ensure_navigation_rebuild(guild)
     return status
 
 
 # -----------------------------
 # Slash commands
 # -----------------------------
-
 
 @app_commands.command(name="set_server_rank", description="(Staff) Set a player's server rank.")
 @in_guild_only()
@@ -1773,12 +1794,11 @@ async def set_server_rank(
         new_rank = str(rank.value)
         await interaction.client.db.set_player_rank(interaction.guild.id, user.id, new_rank)
         await log_command(interaction, f"🏷️ {interaction.user.mention} set server rank for {user.mention} → **{new_rank}**")
-        await refresh_player_views(interaction.client, interaction.guild, user.id, schedule_nav=False)
+        await refresh_player_dashboard(interaction.client, interaction.guild, user.id)
         await safe_reply(interaction, f"✅ Server rank for {user.mention} set to **{new_rank}**.")
     except Exception as e:
         LOG.exception("set_server_rank failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="staff_commands", description="(Staff) Show a list of staff commands.")
 @in_guild_only()
@@ -1800,7 +1820,7 @@ async def staff_commands(interaction: discord.Interaction):
             "• **/ability_upgrade** — Upgrade an ability (costs 5 legacy points; split +/−).",
             "• **/set_available_legacy** — Set available legacy points (does not change lifetime).",
             "• **/set_lifetime_legacy** — Set lifetime legacy points (does not change available).",
-            "• **/refresh_dashboard** — Refresh all dashboard posts.",
+            "• **/refresh_dashboard mode:** initialize / maintenance",
             "",
             "Note: **/char_card** is a private, ephemeral lookup and is not logged.",
         ]
@@ -1809,7 +1829,6 @@ async def staff_commands(interaction: discord.Interaction):
     except Exception as e:
         LOG.exception("staff_commands failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="character_create", description="(Staff) Create a new character for a user.")
 @in_guild_only()
@@ -1820,14 +1839,22 @@ async def character_create(interaction: discord.Interaction, user: discord.Membe
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        await run_db(interaction.client.db.create_character(interaction.guild.id, user.id, character_name, kingdom.value), "create_character")
-        await log_command(interaction, f"🆕 {interaction.user.mention} created character **{character_name}** for {user.mention} (kingdom={kingdom.value})")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, user.id, schedule_nav=True), "refresh_player_views")
+        cid = await run_db(interaction.client.db.create_character(interaction.guild.id, user.id, character_name, kingdom.value), "create_character")
+        await log_command(interaction, f"🆕 {interaction.user.mention} created character **{character_name}** `#{cid}` for {user.mention} (kingdom={kingdom.value})")
+        await run_db(
+            refresh_player_and_schedule_nav(
+                interaction.client,
+                interaction.guild,
+                user.id,
+                dirty_leaderboard=True,
+                dirty_quicklinks=True,
+            ),
+            "refresh_player_and_schedule_nav",
+        )
         await safe_reply(interaction, f"✅ Created **{character_name}** for {user.mention}.")
     except Exception as e:
         LOG.exception("character_create failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="character_delete", description="(Staff) Delete a character (cannot be undone).")
 @in_guild_only()
@@ -1845,12 +1872,20 @@ async def character_delete(interaction: discord.Interaction, character: str):
         if not ok:
             raise RuntimeError("Character not found.")
         await log_command(interaction, f"🗑️ {interaction.user.mention} deleted **{name}** `#{cid}` (owner=<@{user_id}>)")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, user_id, schedule_nav=True), "refresh_player_views")
+        await run_db(
+            refresh_player_and_schedule_nav(
+                interaction.client,
+                interaction.guild,
+                user_id,
+                dirty_leaderboard=True,
+                dirty_quicklinks=True,
+            ),
+            "refresh_player_and_schedule_nav",
+        )
         await safe_reply(interaction, f"✅ Deleted **{name}**.")
     except Exception as e:
         LOG.exception("character_delete failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="character_rename", description="(Staff) Rename a character.")
 @in_guild_only()
@@ -1868,12 +1903,20 @@ async def character_rename(interaction: discord.Interaction, character: str, new
         if not ok:
             raise RuntimeError("Character not found.")
         await log_command(interaction, f"✏️ {interaction.user.mention} renamed **{old}** `#{cid}` → **{new_name.strip()}** (owner=<@{user_id}>)")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, user_id, schedule_nav=True), "refresh_player_views")
+        await run_db(
+            refresh_player_and_schedule_nav(
+                interaction.client,
+                interaction.guild,
+                user_id,
+                dirty_leaderboard=True,
+                dirty_quicklinks=True,
+            ),
+            "refresh_player_and_schedule_nav",
+        )
         await safe_reply(interaction, f"✅ Renamed **{old}** → **{new_name.strip()}**.")
     except Exception as e:
         LOG.exception("character_rename failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="set_char_kingdom", description="(Staff) Set a character's kingdom.")
 @in_guild_only()
@@ -1892,12 +1935,11 @@ async def set_char_kingdom(interaction: discord.Interaction, character: str, kin
         user_id = int(row["user_id"])
         name = str(row["name"])
         await log_command(interaction, f"🏰 {interaction.user.mention} set kingdom for **{name}** `#{cid}` → **{kingdom.value}**")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, user_id, schedule_nav=False), "refresh_player_views")
+        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, user_id), "refresh_player_dashboard")
         await safe_reply(interaction, f"✅ Set **{name}** to kingdom **{kingdom.value}**.")
     except Exception as e:
         LOG.exception("set_char_kingdom failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="award_legacy", description="(Staff) Award legacy points (+/-) and lifetime totals.")
 @in_guild_only()
@@ -1916,12 +1958,11 @@ async def award_legacy(interaction: discord.Interaction, character: str, positiv
         await run_db(interaction.client.db.award_legacy(interaction.guild.id, cid, pos, neg), "award_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"🏅 {interaction.user.mention} awarded legacy to **{st['name']}** `#{cid}`: +{pos}/-{neg}")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=False), "refresh_player_views")
+        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
         await safe_reply(interaction, f"✅ Awarded **{st['name']}**: +{pos}/-{neg}.")
     except Exception as e:
         LOG.exception("award_legacy failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="convert_stars", description="(Staff) Spend 10 legacy points (+/- split allowed) to add a star.")
 @in_guild_only()
@@ -1947,12 +1988,20 @@ async def convert_stars(
         await run_db(interaction.client.db.convert_stars(interaction.guild.id, cid, star_type.value, spend_plus, spend_minus), "convert_stars")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"⭐ {interaction.user.mention} converted legacy to {star_type.name} for **{st['name']}** `#{cid}` (spent +{spend_plus}/-{spend_minus})")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=True), "refresh_player_views")
+        await run_db(
+            refresh_player_and_schedule_nav(
+                interaction.client,
+                interaction.guild,
+                st["user_id"],
+                dirty_leaderboard=True,
+                dirty_quicklinks=False,
+            ),
+            "refresh_player_and_schedule_nav",
+        )
         await safe_reply(interaction, f"✅ Added **{star_type.name}** to **{st['name']}** (spent +{spend_plus}/-{spend_minus}).")
     except Exception as e:
         LOG.exception("convert_stars failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="ability_add", description="(Staff) Add an ability (capacity = 2 + ability stars).")
 @in_guild_only()
@@ -1967,12 +2016,20 @@ async def ability_add(interaction: discord.Interaction, character: str, ability_
         await run_db(interaction.client.db.add_ability(interaction.guild.id, cid, ability_name), "add_ability")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"➕ {interaction.user.mention} added ability **{ability_name.strip()}** to **{st['name']}** `#{cid}`")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=False), "refresh_player_views")
+        await run_db(
+            refresh_player_and_schedule_nav(
+                interaction.client,
+                interaction.guild,
+                st["user_id"],
+                dirty_leaderboard=True,
+                dirty_quicklinks=False,
+            ),
+            "refresh_player_and_schedule_nav",
+        )
         await safe_reply(interaction, f"✅ Added ability **{ability_name.strip()}** to **{st['name']}**.")
     except Exception as e:
         LOG.exception("ability_add failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="ability_rename", description="(Staff) Rename an ability (keeps upgrades).")
 @in_guild_only()
@@ -1989,12 +2046,11 @@ async def ability_rename(interaction: discord.Interaction, character: str, abili
             raise RuntimeError("Ability not found.")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"✏️ {interaction.user.mention} renamed ability on **{st['name']}** `#{cid}`: **{ability}** → **{new_ability_name.strip()}**")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=False), "refresh_player_views")
+        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
         await safe_reply(interaction, f"✅ Renamed ability **{ability}** → **{new_ability_name.strip()}** for **{st['name']}**.")
     except Exception as e:
         LOG.exception("ability_rename failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="ability_upgrade", description="(Staff) Upgrade an ability (cost 5 legacy points; split +/−).")
 @in_guild_only()
@@ -2009,12 +2065,20 @@ async def ability_upgrade(interaction: discord.Interaction, character: str, abil
         new_level, max_level = await run_db(interaction.client.db.upgrade_ability(interaction.guild.id, cid, ability, positive_cost, negative_cost), "upgrade_ability")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"⬆️ {interaction.user.mention} upgraded **{ability}** for **{st['name']}** `#{cid}` to {new_level}/{max_level} (spent +{positive_cost}/-{negative_cost})")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=True), "refresh_player_views")
+        await run_db(
+            refresh_player_and_schedule_nav(
+                interaction.client,
+                interaction.guild,
+                st["user_id"],
+                dirty_leaderboard=True,
+                dirty_quicklinks=False,
+            ),
+            "refresh_player_and_schedule_nav",
+        )
         await safe_reply(interaction, f"✅ Upgraded **{ability}** for **{st['name']}** to {new_level}/{max_level}.")
     except Exception as e:
         LOG.exception("ability_upgrade failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="set_available_legacy", description="(Staff) Set available legacy points (does not change lifetime).")
 @in_guild_only()
@@ -2029,12 +2093,11 @@ async def set_available_legacy(interaction: discord.Interaction, character: str,
         await run_db(interaction.client.db.set_available_legacy(interaction.guild.id, cid, positive, negative), "set_available_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"🧮 {interaction.user.mention} set AVAILABLE legacy for **{st['name']}** `#{cid}` to +{positive}/-{negative}")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=False), "refresh_player_views")
+        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
         await safe_reply(interaction, f"✅ Set available legacy for **{st['name']}** to +{positive}/-{negative}.")
     except Exception as e:
         LOG.exception("set_available_legacy failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="set_lifetime_legacy", description="(Staff) Set lifetime legacy totals (does not change available).")
 @in_guild_only()
@@ -2049,27 +2112,30 @@ async def set_lifetime_legacy(interaction: discord.Interaction, character: str, 
         await run_db(interaction.client.db.set_lifetime_legacy(interaction.guild.id, cid, positive, negative), "set_lifetime_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"📈 {interaction.user.mention} set LIFETIME legacy for **{st['name']}** `#{cid}` to +{positive}/-{negative}")
-        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"], schedule_nav=False), "refresh_player_views")
+        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
         await safe_reply(interaction, f"✅ Set lifetime legacy for **{st['name']}** to +{positive}/-{negative}.")
     except Exception as e:
         LOG.exception("set_lifetime_legacy failed")
         await send_error(interaction, e)
 
-
-@app_commands.command(name="refresh_dashboard", description="(Staff) Refresh all dashboard posts.")
+@app_commands.command(name="refresh_dashboard", description="(Staff) Refresh the dashboard in initialize or maintenance mode.")
 @in_guild_only()
 @staff_only
-async def refresh_dashboard(interaction: discord.Interaction):
+@app_commands.describe(mode="Initialize for slow rebuild from scratch, or maintenance for lighter upkeep")
+@app_commands.choices(mode=REFRESH_MODE_CHOICES)
+async def refresh_dashboard(interaction: discord.Interaction, mode: app_commands.Choice[str]):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        status = await refresh_all_dashboards(interaction.client, interaction.guild)
-        await log_command(interaction, f"🔄 {interaction.user.mention} ran /refresh_dashboard ({status})")
+        if mode.value == "initialize":
+            status = await run_initialize_refresh(interaction.client, interaction.guild)
+        else:
+            status = await run_maintenance_refresh(interaction.client, interaction.guild)
+        await log_command(interaction, f"🔄 {interaction.user.mention} ran /refresh_dashboard mode:{mode.value} ({status})")
         await safe_reply(interaction, status)
     except Exception as e:
         LOG.exception("refresh_dashboard failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="char_card", description="Show a character card privately.")
 @in_guild_only()
@@ -2095,7 +2161,6 @@ async def char_card(interaction: discord.Interaction, character: str):
 # Client
 # -----------------------------
 
-
 class VilyraBotClient(discord.Client):
     def __init__(self, db: Database) -> None:
         intents = discord.Intents.default()
@@ -2105,26 +2170,40 @@ class VilyraBotClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.dashboard_limiter = SimpleRateLimiter(DASHBOARD_EDIT_MIN_INTERVAL)
         self._did_sync = False
+        self._nav_dirty: Dict[int, Dict[str, bool]] = {}
         self._nav_tasks: Dict[int, asyncio.Task] = {}
 
-    def schedule_navigation_refresh(self, guild_id: int) -> None:
-        existing = self._nav_tasks.get(guild_id)
-        if existing and not existing.done():
-            return
-        self._nav_tasks[guild_id] = asyncio.create_task(self._debounced_navigation_refresh(guild_id))
+    def mark_navigation_dirty(self, guild_id: int, *, dirty_leaderboard: bool, dirty_quicklinks: bool) -> None:
+        state = self._nav_dirty.setdefault(guild_id, {"leaderboard": False, "quicklinks": False})
+        if dirty_leaderboard:
+            state["leaderboard"] = True
+        if dirty_quicklinks:
+            state["quicklinks"] = True
 
-    async def _debounced_navigation_refresh(self, guild_id: int) -> None:
-        try:
-            await asyncio.sleep(NAV_REBUILD_DEBOUNCE_SECONDS)
-            guild = self.get_guild(guild_id)
-            if guild is None:
-                return
-            status = await refresh_dashboard_navigation(self, guild, force_repost=False)
-            LOG.info("Debounced navigation refresh for guild %s: %s", guild_id, status)
-        except Exception:
-            LOG.exception("Debounced navigation refresh failed for guild %s", guild_id)
-        finally:
-            self._nav_tasks.pop(guild_id, None)
+    def ensure_navigation_rebuild(self, guild: discord.Guild) -> None:
+        task = self._nav_tasks.get(guild.id)
+        if task and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await asyncio.sleep(NAV_REBUILD_DEBOUNCE_SECONDS)
+                state = self._nav_dirty.pop(guild.id, {"leaderboard": False, "quicklinks": False})
+                if not state["leaderboard"] and not state["quicklinks"]:
+                    return
+                await refresh_dashboard_navigation(
+                    self,
+                    guild,
+                    force_repost=False,
+                    dirty_leaderboard=state["leaderboard"],
+                    dirty_quicklinks=state["quicklinks"],
+                )
+            except Exception:
+                LOG.exception("Debounced navigation rebuild failed for guild_id=%s", guild.id)
+            finally:
+                self._nav_tasks.pop(guild.id, None)
+
+        self._nav_tasks[guild.id] = asyncio.create_task(runner())
 
     async def setup_hook(self) -> None:
         self.tree.add_command(staff_commands)
@@ -2197,10 +2276,10 @@ class VilyraBotClient(discord.Client):
             LOG.info("Startup refresh disabled (set STARTUP_REFRESH=true to enable).")
             return
 
-        LOG.info("Startup dashboard refresh: beginning for %d guild(s)...", len(list(self.guilds)))
+        LOG.info("Startup dashboard refresh: beginning maintenance mode for %d guild(s)...", len(list(self.guilds)))
         for g in list(self.guilds):
             try:
-                status = await refresh_all_dashboards(self, g)
+                status = await run_maintenance_refresh(self, g)
                 LOG.info("Startup dashboard refresh: %s", status)
             except Exception:
                 LOG.exception("Startup dashboard refresh failed")
@@ -2209,7 +2288,6 @@ class VilyraBotClient(discord.Client):
 # -----------------------------
 # Entrypoint
 # -----------------------------
-
 
 async def main_async() -> None:
     token = env("DISCORD_TOKEN")
@@ -2225,13 +2303,11 @@ async def main_async() -> None:
     finally:
         await db.close()
 
-
 def main() -> None:
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass
-
 
 if __name__ == "__main__":
     main()
