@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import hashlib
@@ -37,7 +38,7 @@ MINOR_UPGRADE_COST = 5
 REP_MIN = -100
 REP_MAX = 100
 
-DASHBOARD_TEMPLATE_VERSION = 3
+DASHBOARD_TEMPLATE_VERSION = 5
 DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "1.8"))
 PLAYER_POST_SOFT_LIMIT = 1900
 
@@ -60,7 +61,7 @@ KINGDOM_CHOICES: List[app_commands.Choice[str]] = [app_commands.Choice(name=k, v
 
 BORDER_LEN = 16
 PLAYER_BORDER = "═" * BORDER_LEN
-CHAR_SEPARATOR = "-" * BORDER_LEN
+CHAR_SEPARATOR = "─" * BORDER_LEN
 CHAR_HEADER_LEFT = "꧁•⊹٭ "
 CHAR_HEADER_RIGHT = " ٭⊹•꧂"
 DASHBOARD_SPLIT_MARKER = "\n\n<<POST_SPLIT>>\n\n"
@@ -181,7 +182,6 @@ def render_reputation_block(net_lifetime: int) -> str:
     explainer = left_text + (" " * spaces) + right_text
     return explainer + "\n" + bar_line
 
-
 def dashboard_header(display: str, rank: str, *, continued: bool) -> List[str]:
     label = f"{display} (cont.)" if continued else display
     return [
@@ -279,7 +279,6 @@ class Database:
         )
 
     async def init_schema(self) -> None:
-        # ----- characters -----
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_plus INT NOT NULL DEFAULT 0;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS legacy_minus INT NOT NULL DEFAULT 0;")
@@ -292,13 +291,11 @@ class Database:
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
-        # New: stable numeric id per character (additive; no renames)
         await self._execute("CREATE SEQUENCE IF NOT EXISTS vilyra_character_id_seq;")
         await self._execute("ALTER TABLE characters ADD COLUMN IF NOT EXISTS character_id BIGINT;")
         await self._execute("ALTER TABLE characters ALTER COLUMN character_id SET DEFAULT nextval('vilyra_character_id_seq');")
         await self._execute("UPDATE characters SET character_id=nextval('vilyra_character_id_seq') WHERE character_id IS NULL;")
 
-        # Indexes (best-effort)
         try:
             await self._execute("CREATE UNIQUE INDEX IF NOT EXISTS characters_unique_name ON characters (guild_id, user_id, name);")
         except Exception:
@@ -316,7 +313,6 @@ class Database:
         except Exception:
             LOG.exception("Could not create characters_unique_guild_lower_name; continuing with app-level checks")
 
-        # ----- abilities -----
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS abilities (
@@ -340,8 +336,6 @@ class Database:
         await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS level INT;")
         await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
         await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
-
-        # New: numeric character_id link (additive)
         await self._execute("ALTER TABLE abilities ADD COLUMN IF NOT EXISTS character_id BIGINT;")
         await self._execute(
             """
@@ -364,7 +358,6 @@ class Database:
         except Exception:
             LOG.exception("Could not create abilities_lookup; continuing")
 
-        # ----- dashboard tracking -----
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS dashboard_messages (
@@ -382,7 +375,6 @@ class Database:
         await self._execute("ALTER TABLE dashboard_messages ADD COLUMN IF NOT EXISTS content_hash TEXT;")
         await self._execute("ALTER TABLE dashboard_messages ADD COLUMN IF NOT EXISTS template_version INT NOT NULL DEFAULT 0;")
 
-        # ----- players -----
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS players (
@@ -395,10 +387,24 @@ class Database:
             """
         )
 
+        # ----- dashboard channel meta -----
+        await self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_channel_meta (
+                guild_id                 BIGINT PRIMARY KEY,
+                channel_id               BIGINT NOT NULL,
+                leaderboard_message_id   BIGINT,
+                quicklinks_message_id    BIGINT,
+                updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await self._execute("ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS leaderboard_message_id BIGINT;")
+        await self._execute("ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS quicklinks_message_id BIGINT;")
+        await self._execute("ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+
         await self.detect_schema()
         LOG.info("Database schema initialized / updated")
-
-    # -------- Characters --------
 
     async def get_character_by_guild_name(self, guild_id: int, name: str, include_archived: bool = True) -> Optional[Dict[str, Any]]:
         name = (name or "").strip()
@@ -564,8 +570,6 @@ class Database:
         rows2 = await self._fetchall("SELECT DISTINCT user_id FROM characters WHERE guild_id=%s ORDER BY user_id ASC;", (guild_id,))
         return [int(r["user_id"]) for r in rows2 if r and r.get("user_id") is not None]
 
-    # -------- Players --------
-
     async def get_player_rank(self, guild_id: int, user_id: int) -> str:
         row = await self._fetchone("SELECT server_rank FROM players WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
         return str(row["server_rank"]) if row and row.get("server_rank") else "Newcomer"
@@ -583,8 +587,6 @@ class Database:
             """,
             (guild_id, user_id, rank),
         )
-
-    # -------- Legacy points --------
 
     async def award_legacy(self, guild_id: int, character_id: int, pos: int, neg: int) -> None:
         pos = max(0, int(pos))
@@ -708,8 +710,6 @@ class Database:
                     )
                 else:
                     raise ValueError("star_type must be: ability, influence_positive, influence_negative")
-
-    # -------- Abilities --------
 
     def _ability_level_expr(self) -> str:
         if self.abilities_level_col == "upgrade_level":
@@ -966,7 +966,35 @@ class Database:
                 laurels.append(f"Champion of {ceremonial_name}, {tournament_name}")
         return laurels
 
-    # -------- Dashboard tracking --------
+    async def get_leaderboard_rows(self, guild_id: int) -> List[Dict[str, Any]]:
+        rows = await self._fetchall(
+            """
+            SELECT
+                c.character_id,
+                c.user_id,
+                c.name,
+                COALESCE(c.ability_stars, 0) AS ability_stars,
+                COALESCE(c.influence_plus, 0) AS influence_plus,
+                COALESCE(c.influence_minus, 0) AS influence_minus,
+                COALESCE(SUM(COALESCE(a.upgrade_level, a.level, 0)), 0) AS total_ability_upgrades
+            FROM characters c
+            LEFT JOIN abilities a
+              ON a.guild_id = c.guild_id
+             AND a.character_id = c.character_id
+            WHERE c.guild_id=%s
+              AND COALESCE(c.archived, FALSE)=FALSE
+            GROUP BY c.character_id, c.user_id, c.name, c.ability_stars, c.influence_plus, c.influence_minus
+            ORDER BY c.name ASC, c.character_id ASC;
+            """,
+            (guild_id,),
+        )
+        for row in rows:
+            row["ability_stars"] = safe_int(row.get("ability_stars"), 0)
+            row["influence_plus"] = safe_int(row.get("influence_plus"), 0)
+            row["influence_minus"] = safe_int(row.get("influence_minus"), 0)
+            row["total_ability_upgrades"] = safe_int(row.get("total_ability_upgrades"), 0)
+            row["total_influence_stars"] = row["influence_plus"] + row["influence_minus"]
+        return rows
 
     def _parse_ids(self, s: Optional[str]) -> List[int]:
         if not s:
@@ -1009,6 +1037,40 @@ class Database:
 
     async def clear_dashboard_entry(self, guild_id: int, user_id: int) -> None:
         await self._execute("DELETE FROM dashboard_messages WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
+
+    async def get_dashboard_meta(self, guild_id: int) -> Dict[str, Any]:
+        row = await self._fetchone(
+            """
+            SELECT channel_id, leaderboard_message_id, quicklinks_message_id, updated_at
+            FROM dashboard_channel_meta
+            WHERE guild_id=%s;
+            """,
+            (guild_id,),
+        )
+        return row or {}
+
+    async def set_dashboard_meta(
+        self,
+        guild_id: int,
+        channel_id: int,
+        leaderboard_message_id: Optional[int],
+        quicklinks_message_id: Optional[int],
+    ) -> None:
+        await self._execute(
+            """
+            INSERT INTO dashboard_channel_meta (guild_id, channel_id, leaderboard_message_id, quicklinks_message_id, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (guild_id)
+            DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                          leaderboard_message_id=EXCLUDED.leaderboard_message_id,
+                          quicklinks_message_id=EXCLUDED.quicklinks_message_id,
+                          updated_at=NOW();
+            """,
+            (guild_id, channel_id, leaderboard_message_id, quicklinks_message_id),
+        )
+
+    async def clear_dashboard_meta(self, guild_id: int) -> None:
+        await self._execute("DELETE FROM dashboard_channel_meta WHERE guild_id=%s;", (guild_id,))
 
 
 # -----------------------------
@@ -1054,7 +1116,7 @@ async def build_character_card(db: Database, guild_id: int, character_id: int) -
         tourney_laurels=tourney_laurels,
     )
 
-def render_character_block(card: CharacterCard) -> str:
+def render_character_card_block(card: CharacterCard) -> str:
     net_lifetime = card.lifetime_plus - card.lifetime_minus
     lines: List[str] = []
     lines.append(f"{CHAR_HEADER_LEFT}**{card.name}** {CHAR_HEADER_RIGHT}")
@@ -1082,6 +1144,32 @@ def render_character_block(card: CharacterCard) -> str:
         lines.append("None yet")
     return "\n".join(lines).strip()
 
+def render_dashboard_character_block(card: CharacterCard) -> str:
+    net_lifetime = card.lifetime_plus - card.lifetime_minus
+    lines: List[str] = []
+    lines.append("◆ **" + card.name + "**")
+    k = (card.kingdom or "").strip()
+    lines.append(f"Kingdom: {k}" if k else "Kingdom:")
+    if card.noble_titles:
+        lines.append("Noble Titles: " + " | ".join(card.noble_titles))
+    else:
+        lines.append("Noble Titles:")
+    lines.append(f"Legacy: +{card.legacy_plus}/-{card.legacy_minus} | Lifetime: +{card.lifetime_plus}/-{card.lifetime_minus}")
+    lines.append("Ability Stars: " + render_ability_star_bar(card.ability_stars))
+    lines.append("Influence Stars: " + render_influence_star_bar(card.infl_minus, card.infl_plus))
+    lines.append(render_reputation_block(net_lifetime))
+    if card.abilities:
+        parts = [f"{nm} ({lvl})" for nm, lvl in card.abilities]
+        lines.append("Abilities: " + " | ".join(parts))
+    else:
+        lines.append("Abilities: _none set_")
+    lines.append("__Tourney Laurels__")
+    if card.tourney_laurels:
+        lines.extend(card.tourney_laurels)
+    else:
+        lines.append("None yet")
+    return "\n".join(lines).strip()
+
 async def render_player_posts(db: Database, guild: discord.Guild, user_id: int) -> List[str]:
     member = guild.get_member(user_id)
     display = member.display_name if member else f"User {user_id}"
@@ -1095,7 +1183,7 @@ async def render_player_posts(db: Database, guild: discord.Guild, user_id: int) 
     for r in chars:
         cid = int(r["character_id"])
         card = await build_character_card(db, guild.id, cid)
-        blocks.append(render_character_block(card))
+        blocks.append(render_dashboard_character_block(card))
 
     posts: List[str] = []
     current_lines = dashboard_header(display, rank, continued=False)
@@ -1269,7 +1357,6 @@ def _parse_env_id_set(*names: str) -> set[int]:
                 out.add(int(part))
     return out
 
-
 def staff_only(func=None):
     staff_user_ids = _parse_env_id_set("STAFF_USER_IDS")
     staff_role_ids = _parse_env_id_set("STAFF_ROLES_IDS", "STAFF_ROLE_IDS")
@@ -1304,9 +1391,141 @@ def staff_only(func=None):
     return wrapper
 
 
+def build_message_link(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+def _format_leaderboard_lines(rows: List[Dict[str, Any]], value_key: str, *, label: str, limit: int = 10) -> str:
+    if not rows:
+        return "No characters yet."
+    lines: List[str] = []
+    for idx, row in enumerate(rows[:limit], start=1):
+        name = str(row.get("name") or "Unknown")
+        value = safe_int(row.get(value_key), 0)
+        lines.append(f"{idx}. {name} - {value} {label}")
+    return "\n".join(lines)
+
+def render_leaderboard_embed(guild: discord.Guild, rows: List[Dict[str, Any]]) -> discord.Embed:
+    influential = sorted(
+        rows,
+        key=lambda r: (-safe_int(r.get("total_influence_stars"), 0), -safe_int(r.get("influence_plus"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
+    )
+    powerful = sorted(
+        rows,
+        key=lambda r: (-safe_int(r.get("ability_stars"), 0), -safe_int(r.get("total_ability_upgrades"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
+    )
+    ability_star_leaders = sorted(
+        rows,
+        key=lambda r: (-safe_int(r.get("ability_stars"), 0), -safe_int(r.get("total_ability_upgrades"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
+    )
+    upgraded_leaders = sorted(
+        rows,
+        key=lambda r: (-safe_int(r.get("total_ability_upgrades"), 0), -safe_int(r.get("ability_stars"), 0), str(r.get("name") or "").lower(), safe_int(r.get("character_id"), 0)),
+    )
+
+    embed = discord.Embed(
+        title="Legacy Leaderboards",
+        description="Most influential and most powerful characters in the Legacy system.",
+    )
+    embed.add_field(
+        name="Most Influential",
+        value=_format_leaderboard_lines(influential, "total_influence_stars", label="influence stars"),
+        inline=False,
+    )
+    embed.add_field(
+        name="Most Powerful",
+        value=_format_leaderboard_lines(powerful, "ability_stars", label="ability stars"),
+        inline=False,
+    )
+    embed.add_field(
+        name="Most Ability Stars",
+        value=_format_leaderboard_lines(ability_star_leaders, "ability_stars", label="ability stars"),
+        inline=False,
+    )
+    embed.add_field(
+        name="Most Upgraded Abilities",
+        value=_format_leaderboard_lines(upgraded_leaders, "total_ability_upgrades", label="total upgrades"),
+        inline=False,
+    )
+    embed.set_footer(text=f"{guild.name} Legacy Dashboard")
+    return embed
+
+async def render_quicklinks_embed(
+    db: Database,
+    guild: discord.Guild,
+    channel_id: int,
+    leaderboard_message_id: int,
+) -> discord.Embed:
+    lines: List[str] = [f"[Leaderboard]({build_message_link(guild.id, channel_id, leaderboard_message_id)})"]
+
+    user_ids = await db.list_player_ids(guild.id)
+    for user_id in user_ids:
+        chars = await db.list_characters_for_user(guild.id, user_id, include_archived=False)
+        if not chars:
+            continue
+        message_ids, _, _, _ = await db.get_dashboard_entry(guild.id, user_id)
+        if not message_ids:
+            continue
+        member = guild.get_member(user_id)
+        display = member.display_name if member else f"User {user_id}"
+        target_url = build_message_link(guild.id, channel_id, message_ids[0])
+        lines.append("")
+        lines.append(f"**{display}**")
+        for row in chars:
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            lines.append(f"[{name}]({target_url})")
+
+    description = "\n".join(lines)
+    if len(description) > 4000:
+        description = description[:3950].rstrip() + "\n\n...(truncated)"
+    embed = discord.Embed(
+        title="Quick Links",
+        description=description or "No dashboard links available yet.",
+    )
+    embed.set_footer(text="Jump to leaderboards and character dashboard entries")
+    return embed
+
 # -----------------------------
 # Dashboards
 # -----------------------------
+
+async def refresh_dashboard_navigation(client: "VilyraBotClient", guild: discord.Guild) -> str:
+    db = client.db
+    channel = await get_dashboard_channel(guild)
+    if not channel:
+        return "failed"
+
+    me = guild.me or (guild.get_member(client.user.id) if client.user else None)
+    if me:
+        perms = channel.permissions_for(me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            return "failed"
+
+    rows = await db.get_leaderboard_rows(guild.id)
+    meta = await db.get_dashboard_meta(guild.id)
+    old_leaderboard_id = safe_int(meta.get("leaderboard_message_id"), 0)
+    old_quicklinks_id = safe_int(meta.get("quicklinks_message_id"), 0)
+
+    leaderboard_embed = render_leaderboard_embed(guild, rows)
+    await client.dashboard_limiter.wait()
+    leaderboard_msg = await channel.send(embed=leaderboard_embed)
+
+    quicklinks_embed = await render_quicklinks_embed(db, guild, channel.id, leaderboard_msg.id)
+    await client.dashboard_limiter.wait()
+    quicklinks_msg = await channel.send(embed=quicklinks_embed)
+
+    for old_id in [old_leaderboard_id, old_quicklinks_id]:
+        if old_id:
+            try:
+                old_msg = await channel.fetch_message(old_id)
+                await client.dashboard_limiter.wait()
+                await old_msg.delete()
+            except Exception:
+                pass
+
+    await db.set_dashboard_meta(guild.id, channel.id, leaderboard_msg.id, quicklinks_msg.id)
+    return "updated"
 
 async def refresh_player_dashboard(client: "VilyraBotClient", guild: discord.Guild, user_id: int) -> str:
     db = client.db
@@ -1398,18 +1617,26 @@ async def refresh_all_dashboards(client: "VilyraBotClient", guild: discord.Guild
             counts["failed"] += 1
             await asyncio.sleep(0.25)
 
+    nav_status = await refresh_dashboard_navigation(client, guild)
+
     return (
         "Queued refresh complete: "
         f"{counts['updated']} updated, "
         f"{counts['created']} created, "
         f"{counts['skipped']} skipped, "
         f"{counts['cleared']} cleared, "
-        f"{counts['failed']} failed."
+        f"{counts['failed']} failed. "
+        f"Leaderboards/navigation: {nav_status}."
     )
 
 
+async def refresh_player_views(client: "VilyraBotClient", guild: discord.Guild, user_id: int) -> str:
+    status = await refresh_player_dashboard(client, guild, user_id)
+    await refresh_dashboard_navigation(client, guild)
+    return status
+
 # -----------------------------
-# Slash commands (names exactly as requested)
+# Slash commands
 # -----------------------------
 
 @app_commands.command(name="set_server_rank", description="(Staff) Set a player's server rank.")
@@ -1464,7 +1691,6 @@ async def staff_commands(interaction: discord.Interaction):
         LOG.exception("staff_commands failed")
         await send_error(interaction, e)
 
-
 @app_commands.command(name="character_create", description="(Staff) Create a new character for a user.")
 @in_guild_only()
 @staff_only
@@ -1476,12 +1702,11 @@ async def character_create(interaction: discord.Interaction, user: discord.Membe
         assert interaction.guild is not None
         cid = await run_db(interaction.client.db.create_character(interaction.guild.id, user.id, character_name, kingdom.value), "create_character")
         await log_command(interaction, f"🆕 {interaction.user.mention} created character **{character_name}** `#{cid}` for {user.mention} (kingdom={kingdom.value})")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, user.id), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, user.id), "refresh_player_views")
         await safe_reply(interaction, f"✅ Created **{character_name}** for {user.mention}.")
     except Exception as e:
         LOG.exception("character_create failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="character_delete", description="(Staff) Delete a character (cannot be undone).")
 @in_guild_only()
@@ -1499,12 +1724,11 @@ async def character_delete(interaction: discord.Interaction, character: str):
         if not ok:
             raise RuntimeError("Character not found.")
         await log_command(interaction, f"🗑️ {interaction.user.mention} deleted **{name}** `#{cid}` (owner=<@{user_id}>)")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, user_id), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, user_id), "refresh_player_views")
         await safe_reply(interaction, f"✅ Deleted **{name}**.")
     except Exception as e:
         LOG.exception("character_delete failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="character_rename", description="(Staff) Rename a character.")
 @in_guild_only()
@@ -1522,12 +1746,11 @@ async def character_rename(interaction: discord.Interaction, character: str, new
         if not ok:
             raise RuntimeError("Character not found.")
         await log_command(interaction, f"✏️ {interaction.user.mention} renamed **{old}** `#{cid}` → **{new_name.strip()}** (owner=<@{user_id}>)")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, user_id), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, user_id), "refresh_player_views")
         await safe_reply(interaction, f"✅ Renamed **{old}** → **{new_name.strip()}**.")
     except Exception as e:
         LOG.exception("character_rename failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="set_char_kingdom", description="(Staff) Set a character's kingdom.")
 @in_guild_only()
@@ -1546,12 +1769,11 @@ async def set_char_kingdom(interaction: discord.Interaction, character: str, kin
         user_id = int(row["user_id"])
         name = str(row["name"])
         await log_command(interaction, f"🏰 {interaction.user.mention} set kingdom for **{name}** `#{cid}` → **{kingdom.value}**")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, user_id), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, user_id), "refresh_player_views")
         await safe_reply(interaction, f"✅ Set **{name}** to kingdom **{kingdom.value}**.")
     except Exception as e:
         LOG.exception("set_char_kingdom failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="award_legacy", description="(Staff) Award legacy points (+/-) and lifetime totals.")
 @in_guild_only()
@@ -1570,12 +1792,11 @@ async def award_legacy(interaction: discord.Interaction, character: str, positiv
         await run_db(interaction.client.db.award_legacy(interaction.guild.id, cid, pos, neg), "award_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"🏅 {interaction.user.mention} awarded legacy to **{st['name']}** `#{cid}`: +{pos}/-{neg}")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Awarded **{st['name']}**: +{pos}/-{neg}.")
     except Exception as e:
         LOG.exception("award_legacy failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="convert_stars", description="(Staff) Spend 10 legacy points (+/- split allowed) to add a star.")
 @in_guild_only()
@@ -1601,12 +1822,11 @@ async def convert_stars(
         await run_db(interaction.client.db.convert_stars(interaction.guild.id, cid, star_type.value, spend_plus, spend_minus), "convert_stars")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"⭐ {interaction.user.mention} converted legacy to {star_type.name} for **{st['name']}** `#{cid}` (spent +{spend_plus}/-{spend_minus})")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Added **{star_type.name}** to **{st['name']}** (spent +{spend_plus}/-{spend_minus}).")
     except Exception as e:
         LOG.exception("convert_stars failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="ability_add", description="(Staff) Add an ability (capacity = 2 + ability stars).")
 @in_guild_only()
@@ -1621,12 +1841,11 @@ async def ability_add(interaction: discord.Interaction, character: str, ability_
         await run_db(interaction.client.db.add_ability(interaction.guild.id, cid, ability_name), "add_ability")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"➕ {interaction.user.mention} added ability **{ability_name.strip()}** to **{st['name']}** `#{cid}`")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Added ability **{ability_name.strip()}** to **{st['name']}**.")
     except Exception as e:
         LOG.exception("ability_add failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="ability_rename", description="(Staff) Rename an ability (keeps upgrades).")
 @in_guild_only()
@@ -1643,12 +1862,11 @@ async def ability_rename(interaction: discord.Interaction, character: str, abili
             raise RuntimeError("Ability not found.")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"✏️ {interaction.user.mention} renamed ability on **{st['name']}** `#{cid}`: **{ability}** → **{new_ability_name.strip()}**")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Renamed ability **{ability}** → **{new_ability_name.strip()}** for **{st['name']}**.")
     except Exception as e:
         LOG.exception("ability_rename failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="ability_upgrade", description="(Staff) Upgrade an ability (cost 5 legacy points; split +/−).")
 @in_guild_only()
@@ -1663,12 +1881,11 @@ async def ability_upgrade(interaction: discord.Interaction, character: str, abil
         new_level, max_level = await run_db(interaction.client.db.upgrade_ability(interaction.guild.id, cid, ability, positive_cost, negative_cost), "upgrade_ability")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"⬆️ {interaction.user.mention} upgraded **{ability}** for **{st['name']}** `#{cid}` to {new_level}/{max_level} (spent +{positive_cost}/-{negative_cost})")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Upgraded **{ability}** for **{st['name']}** to {new_level}/{max_level}.")
     except Exception as e:
         LOG.exception("ability_upgrade failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="set_available_legacy", description="(Staff) Set available legacy points (does not change lifetime).")
 @in_guild_only()
@@ -1683,12 +1900,11 @@ async def set_available_legacy(interaction: discord.Interaction, character: str,
         await run_db(interaction.client.db.set_available_legacy(interaction.guild.id, cid, positive, negative), "set_available_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"🧮 {interaction.user.mention} set AVAILABLE legacy for **{st['name']}** `#{cid}` to +{positive}/-{negative}")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Set available legacy for **{st['name']}** to +{positive}/-{negative}.")
     except Exception as e:
         LOG.exception("set_available_legacy failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="set_lifetime_legacy", description="(Staff) Set lifetime legacy totals (does not change available).")
 @in_guild_only()
@@ -1703,12 +1919,11 @@ async def set_lifetime_legacy(interaction: discord.Interaction, character: str, 
         await run_db(interaction.client.db.set_lifetime_legacy(interaction.guild.id, cid, positive, negative), "set_lifetime_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
         await log_command(interaction, f"📈 {interaction.user.mention} set LIFETIME legacy for **{st['name']}** `#{cid}` to +{positive}/-{negative}")
-        await run_db(refresh_player_dashboard(interaction.client, interaction.guild, st["user_id"]), "refresh_player_dashboard")
+        await run_db(refresh_player_views(interaction.client, interaction.guild, st["user_id"]), "refresh_player_views")
         await safe_reply(interaction, f"✅ Set lifetime legacy for **{st['name']}** to +{positive}/-{negative}.")
     except Exception as e:
         LOG.exception("set_lifetime_legacy failed")
         await send_error(interaction, e)
-
 
 @app_commands.command(name="refresh_dashboard", description="(Staff) Refresh all dashboard posts.")
 @in_guild_only()
@@ -1724,7 +1939,6 @@ async def refresh_dashboard(interaction: discord.Interaction):
         LOG.exception("refresh_dashboard failed")
         await send_error(interaction, e)
 
-
 @app_commands.command(name="char_card", description="Show a character card privately.")
 @in_guild_only()
 @app_commands.describe(character="Character (autocomplete)")
@@ -1738,7 +1952,7 @@ async def char_card(interaction: discord.Interaction, character: str):
         owner_id = int(row["user_id"])
         owner = interaction.guild.get_member(owner_id)
         owner_mention = owner.mention if owner else f"<@{owner_id}>"
-        text = f"{owner_mention}\n\n" + render_character_block(card)
+        text = f"{owner_mention}\n\n" + render_character_card_block(card)
         await safe_reply(interaction, text)
     except Exception as e:
         LOG.exception("char_card failed")
