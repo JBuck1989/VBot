@@ -25,7 +25,7 @@ MINOR_UPGRADE_COST = 5
 REP_MIN = -100
 REP_MAX = 100
 
-DASHBOARD_TEMPLATE_VERSION = 9
+DASHBOARD_TEMPLATE_VERSION = 10
 DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "3.0"))
 NAV_REBUILD_DEBOUNCE_SECONDS = float(os.getenv("NAV_REBUILD_DEBOUNCE_SECONDS", "12.0"))
 BOOTSTRAP_PLAYER_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_PLAYER_PAUSE_SECONDS", "3.0"))
@@ -34,6 +34,7 @@ BOOTSTRAP_BATCH_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_BATCH_PAUSE_SECONDS",
 BOOTSTRAP_NAV_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_NAV_PAUSE_SECONDS", "10.0"))
 MAINTENANCE_PLAYER_PAUSE_SECONDS = float(os.getenv("MAINTENANCE_PLAYER_PAUSE_SECONDS", "0.8"))
 EMBED_COLOR = 0x7FA1B1
+QUICKLINKS_DESC_SOFT_LIMIT = int(os.getenv("QUICKLINKS_DESC_SOFT_LIMIT", "3800"))
 
 SERVER_RANKS = [
     "Newcomer",
@@ -358,19 +359,21 @@ class Database:
         await self._execute(
             """
             CREATE TABLE IF NOT EXISTS dashboard_channel_meta (
-                guild_id                 BIGINT PRIMARY KEY,
-                channel_id               BIGINT NOT NULL,
-                leaderboard_message_id   BIGINT,
-                quicklinks_message_id    BIGINT,
-                leaderboard_hash         TEXT,
-                quicklinks_hash          TEXT,
-                updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                guild_id                  BIGINT PRIMARY KEY,
+                channel_id                BIGINT NOT NULL,
+                leaderboard_message_id    BIGINT,
+                quicklinks_message_id     BIGINT,
+                quicklinks_message_ids    TEXT,
+                leaderboard_hash          TEXT,
+                quicklinks_hash           TEXT,
+                updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
         for s in [
             "ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS leaderboard_message_id BIGINT;",
             "ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS quicklinks_message_id BIGINT;",
+            "ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS quicklinks_message_ids TEXT;",
             "ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS leaderboard_hash TEXT;",
             "ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS quicklinks_hash TEXT;",
             "ALTER TABLE dashboard_channel_meta ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();",
@@ -486,9 +489,20 @@ class Database:
             SELECT character_id, user_id, name
             FROM characters
             WHERE guild_id=%s AND COALESCE(archived, FALSE)=FALSE
-            ORDER BY name ASC, character_id ASC;
+            ORDER BY character_id ASC;
             """,
             (guild_id,),
+        )
+
+    async def list_active_characters_for_user(self, guild_id: int, user_id: int) -> List[Dict[str, Any]]:
+        return await self._fetchall(
+            """
+            SELECT character_id, user_id, name
+            FROM characters
+            WHERE guild_id=%s AND user_id=%s AND COALESCE(archived, FALSE)=FALSE
+            ORDER BY character_id ASC;
+            """,
+            (guild_id, user_id),
         )
 
     async def get_character_message_entry(self, guild_id: int, character_id: int) -> Dict[str, Any]:
@@ -506,13 +520,36 @@ class Database:
     async def clear_character_message_entries_for_guild(self, guild_id: int) -> None:
         await self._execute("DELETE FROM dashboard_character_messages WHERE guild_id=%s;", (guild_id,))
 
-    async def get_dashboard_meta(self, guild_id: int) -> Dict[str, Any]:
-        return (await self._fetchone("SELECT channel_id, leaderboard_message_id, quicklinks_message_id, leaderboard_hash, quicklinks_hash, updated_at FROM dashboard_channel_meta WHERE guild_id=%s;", (guild_id,))) or {}
+    def _parse_id_list(self, raw_value: Any) -> List[int]:
+        if raw_value is None:
+            return []
+        out: List[int] = []
+        for part in str(raw_value).split(","):
+            part = part.strip()
+            if part.isdigit():
+                out.append(int(part))
+        return out
 
-    async def set_dashboard_meta(self, guild_id: int, channel_id: int, leaderboard_message_id: Optional[int], quicklinks_message_id: Optional[int], leaderboard_hash: Optional[str], quicklinks_hash: Optional[str]) -> None:
+    def _format_id_list(self, ids: Sequence[int]) -> Optional[str]:
+        vals = [str(int(x)) for x in ids if safe_int(x, 0) > 0]
+        return ",".join(vals) if vals else None
+
+    async def get_dashboard_meta(self, guild_id: int) -> Dict[str, Any]:
+        row = (await self._fetchone(
+            "SELECT channel_id, leaderboard_message_id, quicklinks_message_id, quicklinks_message_ids, leaderboard_hash, quicklinks_hash, updated_at FROM dashboard_channel_meta WHERE guild_id=%s;",
+            (guild_id,),
+        )) or {}
+        quicklink_ids = self._parse_id_list(row.get("quicklinks_message_ids"))
+        if not quicklink_ids and safe_int(row.get("quicklinks_message_id"), 0) > 0:
+            quicklink_ids = [safe_int(row.get("quicklinks_message_id"), 0)]
+        row["quicklinks_message_ids_list"] = quicklink_ids
+        return row
+
+    async def set_dashboard_meta(self, guild_id: int, channel_id: int, leaderboard_message_id: Optional[int], quicklinks_message_ids: Sequence[int], leaderboard_hash: Optional[str], quicklinks_hash: Optional[str]) -> None:
+        first_quicklink_id = int(quicklinks_message_ids[0]) if quicklinks_message_ids else None
         await self._execute(
-            "INSERT INTO dashboard_channel_meta (guild_id, channel_id, leaderboard_message_id, quicklinks_message_id, leaderboard_hash, quicklinks_hash, updated_at) VALUES (%s, %s, %s, %s, %s, %s, NOW()) ON CONFLICT (guild_id) DO UPDATE SET channel_id=EXCLUDED.channel_id, leaderboard_message_id=EXCLUDED.leaderboard_message_id, quicklinks_message_id=EXCLUDED.quicklinks_message_id, leaderboard_hash=EXCLUDED.leaderboard_hash, quicklinks_hash=EXCLUDED.quicklinks_hash, updated_at=NOW();",
-            (guild_id, channel_id, leaderboard_message_id, quicklinks_message_id, leaderboard_hash, quicklinks_hash),
+            "INSERT INTO dashboard_channel_meta (guild_id, channel_id, leaderboard_message_id, quicklinks_message_id, quicklinks_message_ids, leaderboard_hash, quicklinks_hash, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW()) ON CONFLICT (guild_id) DO UPDATE SET channel_id=EXCLUDED.channel_id, leaderboard_message_id=EXCLUDED.leaderboard_message_id, quicklinks_message_id=EXCLUDED.quicklinks_message_id, quicklinks_message_ids=EXCLUDED.quicklinks_message_ids, leaderboard_hash=EXCLUDED.leaderboard_hash, quicklinks_hash=EXCLUDED.quicklinks_hash, updated_at=NOW();",
+            (guild_id, channel_id, leaderboard_message_id, first_quicklink_id, self._format_id_list(quicklinks_message_ids), leaderboard_hash, quicklinks_hash),
         )
 
     async def clear_dashboard_meta(self, guild_id: int) -> None:
@@ -678,6 +715,7 @@ class CharacterCard:
     name: str
     character_id: int
     user_id: int
+    player_display: str
     kingdom: str
     noble_titles: List[str]
     legacy_plus: int
@@ -691,14 +729,17 @@ class CharacterCard:
     tourney_laurels: List[str]
 
 
-async def build_character_card(db: Database, guild_id: int, character_id: int) -> CharacterCard:
-    st = await db.get_character_state(guild_id, character_id)
+async def build_character_card(db: Database, guild: discord.Guild, character_id: int) -> CharacterCard:
+    st = await db.get_character_state(guild.id, character_id)
+    member = guild.get_member(st["user_id"])
+    player_display = member.display_name if member else f"User {st['user_id']}"
     return CharacterCard(
         name=st["name"],
         character_id=st["character_id"],
         user_id=st["user_id"],
+        player_display=player_display,
         kingdom=st["kingdom"],
-        noble_titles=await db.list_noble_titles_for_character(guild_id, st["name"]),
+        noble_titles=await db.list_noble_titles_for_character(guild.id, st["name"]),
         legacy_plus=st["legacy_plus"],
         legacy_minus=st["legacy_minus"],
         lifetime_plus=st["lifetime_plus"],
@@ -706,14 +747,15 @@ async def build_character_card(db: Database, guild_id: int, character_id: int) -
         ability_stars=st["ability_stars"],
         infl_plus=st["influence_plus"],
         infl_minus=st["influence_minus"],
-        abilities=await db.list_abilities_for_character(guild_id, character_id),
-        tourney_laurels=await db.list_tourney_laurels_for_character(guild_id, character_id),
+        abilities=await db.list_abilities_for_character(guild.id, character_id),
+        tourney_laurels=await db.list_tourney_laurels_for_character(guild.id, character_id),
     )
 
 
 def render_character_embed(card: CharacterCard) -> discord.Embed:
     net_lifetime = card.lifetime_plus - card.lifetime_minus
     desc_lines = [
+        f"👤 Player: {card.player_display}",
         f"🏰 Kingdom: {card.kingdom}" if card.kingdom else "🏰 Kingdom:",
         f"👑 Noble Titles: {' | '.join(card.noble_titles)}" if card.noble_titles else "👑 Noble Titles:",
         "",
@@ -755,19 +797,32 @@ def render_leaderboard_embed(guild: discord.Guild, rows: List[Dict[str, Any]]) -
     return embed
 
 
-async def render_quicklinks_embed(db: Database, guild: discord.Guild, channel_id: int, leaderboard_message_id: int) -> discord.Embed:
+async def render_quicklinks_embeds(db: Database, guild: discord.Guild, channel_id: int, leaderboard_message_id: int) -> List[discord.Embed]:
     chars = await db.list_active_characters_for_guild(guild.id)
-    parts = [f"🏆 [LEADERBOARD]({build_message_link(guild.id, channel_id, leaderboard_message_id)}) 🏆", ""]
-    link_parts: List[str] = []
+    header = f"🏆 [LEADERBOARD]({build_message_link(guild.id, channel_id, leaderboard_message_id)}) 🏆"
+    chunks: List[str] = []
+    current = header + "\n\n"
     for row in chars:
         entry = await db.get_character_message_entry(guild.id, int(row["character_id"]))
         mid = safe_int(entry.get("message_id"), 0)
-        if mid:
-            link_parts.append(f"[{str(row['name'])}]({build_message_link(guild.id, channel_id, mid)})")
-    description = "\n".join(parts) + (" | ".join(link_parts) if link_parts else "No character links available yet.")
-    if len(description) > 4000:
-        description = description[:3950].rstrip() + " ..."
-    return discord.Embed(title="🧭 Quick Links", description=description, color=EMBED_COLOR)
+        if mid <= 0:
+            continue
+        link_text = f"[{str(row['name'])}]({build_message_link(guild.id, channel_id, mid)})"
+        candidate = current + (link_text if current.endswith("\n\n") else " | " + link_text)
+        if len(candidate) > QUICKLINKS_DESC_SOFT_LIMIT and not current.endswith("\n\n"):
+            chunks.append(current)
+            current = link_text
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current)
+    if not chunks:
+        chunks = [header + "\n\nNo character links available yet."]
+    embeds: List[discord.Embed] = []
+    for idx, chunk in enumerate(chunks):
+        title = "🧭 Quick Links" if idx == 0 else "🧭 Quick Links (cont.)"
+        embeds.append(discord.Embed(title=title, description=chunk, color=EMBED_COLOR))
+    return embeds
 
 
 async def get_dashboard_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -826,7 +881,7 @@ async def refresh_character_embed(client: "VilyraBotClient", guild: discord.Guil
         if not (perms.view_channel and perms.send_messages and perms.embed_links):
             return "failed"
 
-    card = await build_character_card(db, guild.id, character_id)
+    card = await build_character_card(db, guild, character_id)
     embed = render_character_embed(card)
     new_hash = embed_hash(embed)
     entry = await db.get_character_message_entry(guild.id, character_id)
@@ -880,11 +935,17 @@ async def refresh_dashboard_navigation(client: "VilyraBotClient", guild: discord
 
     meta = await db.get_dashboard_meta(guild.id)
     old_leaderboard_id = safe_int(meta.get("leaderboard_message_id"), 0)
-    old_quicklinks_id = safe_int(meta.get("quicklinks_message_id"), 0)
+    old_quicklinks_ids = list(meta.get("quicklinks_message_ids_list") or [])
     old_leaderboard_hash = str(meta.get("leaderboard_hash") or "")
     old_quicklinks_hash = str(meta.get("quicklinks_hash") or "")
+
     leaderboard_msg = None if force_repost or not old_leaderboard_id else await _safe_fetch_message(channel, old_leaderboard_id)
-    quicklinks_msg = None if force_repost or not old_quicklinks_id else await _safe_fetch_message(channel, old_quicklinks_id)
+    old_quicklink_msgs: List[discord.Message] = []
+    if not force_repost:
+        for mid in old_quicklinks_ids:
+            msg = await _safe_fetch_message(channel, mid)
+            if msg is not None:
+                old_quicklink_msgs.append(msg)
 
     rows = await db.get_leaderboard_rows(guild.id)
     leaderboard_embed = render_leaderboard_embed(guild, rows)
@@ -899,17 +960,36 @@ async def refresh_dashboard_navigation(client: "VilyraBotClient", guild: discord
     if leaderboard_msg is None:
         return "failed"
 
-    quicklinks_embed = await render_quicklinks_embed(db, guild, channel.id, leaderboard_msg.id)
-    quicklinks_hash = embed_hash(quicklinks_embed)
-    if force_repost or quicklinks_msg is None:
-        await client.dashboard_limiter.wait()
-        quicklinks_msg = await channel.send(embed=quicklinks_embed)
+    quicklinks_embeds = await render_quicklinks_embeds(db, guild, channel.id, leaderboard_msg.id)
+    quicklinks_hash = content_hash("\n".join(embed_hash(e) for e in quicklinks_embeds))
+    new_quicklink_ids: List[int] = []
+
+    if force_repost or not old_quicklink_msgs:
+        for embed in quicklinks_embeds:
+            await client.dashboard_limiter.wait()
+            msg = await channel.send(embed=embed)
+            new_quicklink_ids.append(msg.id)
     elif dirty_quicklinks and quicklinks_hash != old_quicklinks_hash:
-        await client.dashboard_limiter.wait()
-        await quicklinks_msg.edit(embed=quicklinks_embed)
+        for idx, embed in enumerate(quicklinks_embeds):
+            if idx < len(old_quicklink_msgs):
+                await client.dashboard_limiter.wait()
+                await old_quicklink_msgs[idx].edit(embed=embed)
+                new_quicklink_ids.append(old_quicklink_msgs[idx].id)
+            else:
+                await client.dashboard_limiter.wait()
+                msg = await channel.send(embed=embed)
+                new_quicklink_ids.append(msg.id)
+        for extra in old_quicklink_msgs[len(quicklinks_embeds):]:
+            try:
+                await client.dashboard_limiter.wait()
+                await extra.delete()
+            except Exception:
+                pass
+    else:
+        new_quicklink_ids = [m.id for m in old_quicklink_msgs]
 
     if force_repost:
-        for old_id in [old_leaderboard_id, old_quicklinks_id]:
+        for old_id in [old_leaderboard_id]:
             if old_id:
                 old_msg = await _safe_fetch_message(channel, old_id)
                 if old_msg:
@@ -918,8 +998,16 @@ async def refresh_dashboard_navigation(client: "VilyraBotClient", guild: discord
                         await old_msg.delete()
                     except Exception:
                         pass
+        for old_id in old_quicklinks_ids:
+            old_msg = await _safe_fetch_message(channel, old_id)
+            if old_msg:
+                try:
+                    await client.dashboard_limiter.wait()
+                    await old_msg.delete()
+                except Exception:
+                    pass
 
-    await db.set_dashboard_meta(guild.id, channel.id, leaderboard_msg.id if leaderboard_msg else None, quicklinks_msg.id if quicklinks_msg else None, leaderboard_hash, quicklinks_hash)
+    await db.set_dashboard_meta(guild.id, channel.id, leaderboard_msg.id if leaderboard_msg else None, new_quicklink_ids, leaderboard_hash, quicklinks_hash)
     return "updated"
 
 
@@ -1416,7 +1504,7 @@ async def char_card(interaction: discord.Interaction, character: str):
     try:
         assert interaction.guild is not None
         cid, row = await resolve_character(interaction, character)
-        card = await run_db(build_character_card(interaction.client.db, interaction.guild.id, cid), "build_character_card")
+        card = await run_db(build_character_card(interaction.client.db, interaction.guild, cid), "build_character_card")
         owner_id = int(row["user_id"])
         owner = interaction.guild.get_member(owner_id)
         owner_mention = owner.mention if owner else f"<@{owner_id}>"
@@ -1519,6 +1607,19 @@ class VilyraBotClient(discord.Client):
                 LOG.info("Startup dashboard refresh: %s", status)
             except Exception:
                 LOG.exception("Startup dashboard refresh failed")
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        if before.display_name == after.display_name:
+            return
+        try:
+            chars = await self.db.list_active_characters_for_user(after.guild.id, after.id)
+            for row in chars:
+                try:
+                    await refresh_character_embed(self, after.guild, int(row["character_id"]))
+                except Exception:
+                    LOG.exception("Failed to refresh character embed after nickname change for character_id=%s", row.get("character_id"))
+        except Exception:
+            LOG.exception("on_member_update handling failed for user_id=%s", after.id)
 
 
 async def main_async() -> None:
