@@ -25,7 +25,7 @@ MINOR_UPGRADE_COST = 5
 REP_MIN = -100
 REP_MAX = 100
 
-DASHBOARD_TEMPLATE_VERSION = 10
+DASHBOARD_TEMPLATE_VERSION = 11
 DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "3.0"))
 NAV_REBUILD_DEBOUNCE_SECONDS = float(os.getenv("NAV_REBUILD_DEBOUNCE_SECONDS", "12.0"))
 BOOTSTRAP_PLAYER_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_PLAYER_PAUSE_SECONDS", "3.0"))
@@ -870,7 +870,7 @@ async def _safe_fetch_message(channel: discord.TextChannel, message_id: int) -> 
         return None
 
 
-async def refresh_character_embed(client: "VilyraBotClient", guild: discord.Guild, character_id: int) -> str:
+async def refresh_character_embed(client: "VilyraBotClient", guild: discord.Guild, character_id: int, *, allow_recreate: bool = False) -> str:
     db = client.db
     channel = await get_dashboard_channel(guild)
     if not channel:
@@ -888,19 +888,33 @@ async def refresh_character_embed(client: "VilyraBotClient", guild: discord.Guil
     old_hash = str(entry.get("content_hash") or "")
     old_tv = safe_int(entry.get("template_version"), 0)
     old_mid = safe_int(entry.get("message_id"), 0)
-    old_msg = await _safe_fetch_message(channel, old_mid) if old_mid else None
 
-    if old_msg and old_hash == new_hash and old_tv == DASHBOARD_TEMPLATE_VERSION:
-        return "skipped"
-    if old_msg:
+    if old_mid <= 0:
+        if not allow_recreate:
+            LOG.error("No stored dashboard message_id for character_id=%s; refusing to recreate outside initialize flow", character_id)
+            return "missing"
         await client.dashboard_limiter.wait()
-        await old_msg.edit(embed=embed)
-        await db.set_character_message_entry(guild.id, character_id, channel.id, old_msg.id, new_hash)
-        return "updated"
+        msg = await channel.send(embed=embed)
+        await db.set_character_message_entry(guild.id, character_id, channel.id, msg.id, new_hash)
+        return "created"
+
+    old_msg = await _safe_fetch_message(channel, old_mid)
+    if old_msg is None:
+        if not allow_recreate:
+            LOG.error("Stored dashboard message missing for character_id=%s message_id=%s; refusing to recreate outside initialize flow", character_id, old_mid)
+            return "missing"
+        await client.dashboard_limiter.wait()
+        msg = await channel.send(embed=embed)
+        await db.set_character_message_entry(guild.id, character_id, channel.id, msg.id, new_hash)
+        return "created"
+
+    if old_hash == new_hash and old_tv == DASHBOARD_TEMPLATE_VERSION:
+        return "skipped"
+
     await client.dashboard_limiter.wait()
-    msg = await channel.send(embed=embed)
-    await db.set_character_message_entry(guild.id, character_id, channel.id, msg.id, new_hash)
-    return "created"
+    await old_msg.edit(embed=embed)
+    await db.set_character_message_entry(guild.id, character_id, channel.id, old_msg.id, new_hash)
+    return "updated"
 
 
 async def delete_character_embed_if_exists(client: "VilyraBotClient", guild: discord.Guild, character_id: int) -> None:
@@ -1020,7 +1034,7 @@ async def run_initialize_refresh(client: "VilyraBotClient", guild: discord.Guild
     await db.clear_dashboard_meta(guild.id)
 
     chars = await db.list_active_characters_for_guild(guild.id)
-    counts = {"updated": 0, "created": 0, "skipped": 0, "cleared": 0, "failed": 0}
+    counts = {"updated": 0, "created": 0, "skipped": 0, "missing": 0, "cleared": 0, "failed": 0}
 
     nav_status = await refresh_dashboard_navigation(client, guild, force_repost=True, dirty_leaderboard=True, dirty_quicklinks=False)
     await asyncio.sleep(BOOTSTRAP_NAV_PAUSE_SECONDS)
@@ -1028,7 +1042,7 @@ async def run_initialize_refresh(client: "VilyraBotClient", guild: discord.Guild
     for idx, row in enumerate(chars, start=1):
         cid = int(row["character_id"])
         try:
-            status = await refresh_character_embed(client, guild, cid)
+            status = await refresh_character_embed(client, guild, cid, allow_recreate=True)
             counts[status if status in counts else "failed"] += 1
         except Exception:
             LOG.exception("initialize refresh_character_embed failed for character_id=%s", cid)
@@ -1045,6 +1059,7 @@ async def run_initialize_refresh(client: "VilyraBotClient", guild: discord.Guild
         f"{counts['updated']} updated, "
         f"{counts['created']} created, "
         f"{counts['skipped']} skipped, "
+        f"{counts['missing']} missing, "
         f"{counts['cleared']} cleared, "
         f"{counts['failed']} failed. "
         f"Leaderboards/navigation: {nav_status}."
@@ -1053,11 +1068,11 @@ async def run_initialize_refresh(client: "VilyraBotClient", guild: discord.Guild
 
 async def run_maintenance_refresh(client: "VilyraBotClient", guild: discord.Guild) -> str:
     chars = await client.db.list_active_characters_for_guild(guild.id)
-    counts = {"updated": 0, "created": 0, "skipped": 0, "cleared": 0, "failed": 0}
+    counts = {"updated": 0, "created": 0, "skipped": 0, "missing": 0, "cleared": 0, "failed": 0}
     for row in chars:
         cid = int(row["character_id"])
         try:
-            status = await refresh_character_embed(client, guild, cid)
+            status = await refresh_character_embed(client, guild, cid, allow_recreate=False)
             counts[status if status in counts else "failed"] += 1
         except Exception:
             LOG.exception("maintenance refresh_character_embed failed for character_id=%s", cid)
@@ -1070,6 +1085,7 @@ async def run_maintenance_refresh(client: "VilyraBotClient", guild: discord.Guil
         f"{counts['updated']} updated, "
         f"{counts['created']} created, "
         f"{counts['skipped']} skipped, "
+        f"{counts['missing']} missing, "
         f"{counts['cleared']} cleared, "
         f"{counts['failed']} failed. "
         f"Leaderboards/navigation: {nav_status}."
@@ -1503,13 +1519,10 @@ async def char_card(interaction: discord.Interaction, character: str):
     await defer_ephemeral(interaction)
     try:
         assert interaction.guild is not None
-        cid, row = await resolve_character(interaction, character)
+        cid, _ = await resolve_character(interaction, character)
         card = await run_db(build_character_card(interaction.client.db, interaction.guild, cid), "build_character_card")
-        owner_id = int(row["user_id"])
-        owner = interaction.guild.get_member(owner_id)
-        owner_mention = owner.mention if owner else f"<@{owner_id}>"
-        text = f"{owner_mention}\n\n{render_character_embed(card).description}"
-        await safe_reply(interaction, text)
+        embed = render_character_embed(card)
+        await safe_reply(interaction, "", embed=embed)
     except Exception as e:
         LOG.exception("char_card failed")
         await send_error(interaction, e)
