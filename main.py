@@ -25,7 +25,7 @@ MINOR_UPGRADE_COST = 5
 REP_MIN = -100
 REP_MAX = 100
 
-DASHBOARD_TEMPLATE_VERSION = 11
+DASHBOARD_TEMPLATE_VERSION = 12
 DASHBOARD_EDIT_MIN_INTERVAL = float(os.getenv("DASHBOARD_EDIT_MIN_INTERVAL", "3.0"))
 NAV_REBUILD_DEBOUNCE_SECONDS = float(os.getenv("NAV_REBUILD_DEBOUNCE_SECONDS", "12.0"))
 BOOTSTRAP_PLAYER_PAUSE_SECONDS = float(os.getenv("BOOTSTRAP_PLAYER_PAUSE_SECONDS", "3.0"))
@@ -520,6 +520,17 @@ class Database:
     async def clear_character_message_entries_for_guild(self, guild_id: int) -> None:
         await self._execute("DELETE FROM dashboard_character_messages WHERE guild_id=%s;", (guild_id,))
 
+    async def list_character_message_entries_for_guild(self, guild_id: int) -> List[Dict[str, Any]]:
+        return await self._fetchall(
+            """
+            SELECT character_id, channel_id, message_id
+            FROM dashboard_character_messages
+            WHERE guild_id=%s
+            ORDER BY character_id ASC;
+            """,
+            (guild_id,),
+        )
+
     def _parse_id_list(self, raw_value: Any) -> List[int]:
         if raw_value is None:
             return []
@@ -702,6 +713,85 @@ class Database:
             "UPDATE characters SET legacy_plus = legacy_plus + %s, legacy_minus = legacy_minus + %s, lifetime_plus = lifetime_plus + %s, lifetime_minus = lifetime_minus + %s, updated_at = NOW() WHERE guild_id=%s AND character_id=%s;",
             (max(0, int(pos)), max(0, int(neg)), max(0, int(pos)), max(0, int(neg)), guild_id, int(character_id)),
         )
+
+    async def convert_stars(self, guild_id: int, character_id: int, star_type: str, spend_plus: int, spend_minus: int) -> None:
+        star_type = (star_type or "").strip().lower()
+        spend_plus = max(0, int(spend_plus))
+        spend_minus = max(0, int(spend_minus))
+        if spend_plus + spend_minus != STAR_COST:
+            raise ValueError(f"Star conversion cost is exactly {STAR_COST} total points (+ and - may split).")
+
+        conn = self._require_conn()
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT legacy_plus, legacy_minus, ability_stars, influence_plus, influence_minus
+                    FROM characters
+                    WHERE guild_id=%s AND character_id=%s
+                    FOR UPDATE;
+                    """,
+                    (guild_id, int(character_id)),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    raise ValueError("Character not found.")
+
+                legacy_plus = safe_int(row.get("legacy_plus"), 0)
+                legacy_minus = safe_int(row.get("legacy_minus"), 0)
+                ability_stars = safe_int(row.get("ability_stars"), 0)
+                influence_plus = safe_int(row.get("influence_plus"), 0)
+                influence_minus = safe_int(row.get("influence_minus"), 0)
+
+                if legacy_plus < spend_plus:
+                    raise ValueError(f"Not enough available positive points (need {spend_plus}, have {legacy_plus}).")
+                if legacy_minus < spend_minus:
+                    raise ValueError(f"Not enough available negative points (need {spend_minus}, have {legacy_minus}).")
+
+                if star_type == "ability":
+                    if ability_stars >= MAX_ABILITY_STARS:
+                        raise ValueError("Ability stars already at max (5).")
+                    await cur.execute(
+                        """
+                        UPDATE characters
+                           SET legacy_plus=legacy_plus-%s,
+                               legacy_minus=legacy_minus-%s,
+                               ability_stars=ability_stars+1,
+                               updated_at=NOW()
+                         WHERE guild_id=%s AND character_id=%s;
+                        """,
+                        (spend_plus, spend_minus, guild_id, int(character_id)),
+                    )
+                elif star_type == "influence_positive":
+                    if influence_plus + influence_minus >= MAX_INFL_STARS_TOTAL:
+                        raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+                    await cur.execute(
+                        """
+                        UPDATE characters
+                           SET legacy_plus=legacy_plus-%s,
+                               legacy_minus=legacy_minus-%s,
+                               influence_plus=influence_plus+1,
+                               updated_at=NOW()
+                         WHERE guild_id=%s AND character_id=%s;
+                        """,
+                        (spend_plus, spend_minus, guild_id, int(character_id)),
+                    )
+                elif star_type == "influence_negative":
+                    if influence_plus + influence_minus >= MAX_INFL_STARS_TOTAL:
+                        raise ValueError("Total influence stars (pos+neg) cannot exceed 5.")
+                    await cur.execute(
+                        """
+                        UPDATE characters
+                           SET legacy_plus=legacy_plus-%s,
+                               legacy_minus=legacy_minus-%s,
+                               influence_minus=influence_minus+1,
+                               updated_at=NOW()
+                         WHERE guild_id=%s AND character_id=%s;
+                        """,
+                        (spend_plus, spend_minus, guild_id, int(character_id)),
+                    )
+                else:
+                    raise ValueError("star_type must be: ability, influence_positive, influence_negative")
 
     async def set_available_legacy(self, guild_id: int, character_id: int, pos: int, neg: int) -> None:
         await self._execute("UPDATE characters SET legacy_plus=%s, legacy_minus=%s, updated_at=NOW() WHERE guild_id=%s AND character_id=%s;", (max(0, int(pos)), max(0, int(neg)), guild_id, int(character_id)))
@@ -936,6 +1026,37 @@ async def delete_character_embed_if_exists(client: "VilyraBotClient", guild: dis
     await db.clear_character_message_entry(guild.id, character_id)
 
 
+async def delete_tracked_dashboard_messages(client: "VilyraBotClient", guild: discord.Guild) -> None:
+    db = client.db
+    channel = await get_dashboard_channel(guild)
+    if not channel:
+        return
+
+    for row in await db.list_character_message_entries_for_guild(guild.id):
+        mid = safe_int(row.get("message_id"), 0)
+        if mid <= 0:
+            continue
+        msg = await _safe_fetch_message(channel, mid)
+        if msg:
+            try:
+                await client.dashboard_limiter.wait()
+                await msg.delete()
+            except Exception:
+                pass
+
+    meta = await db.get_dashboard_meta(guild.id)
+    mids = [safe_int(meta.get("leaderboard_message_id"), 0), *list(meta.get("quicklinks_message_ids_list") or [])]
+    for mid in mids:
+        if mid <= 0:
+            continue
+        msg = await _safe_fetch_message(channel, mid)
+        if msg:
+            try:
+                await client.dashboard_limiter.wait()
+                await msg.delete()
+            except Exception:
+                pass
+
 async def refresh_dashboard_navigation(client: "VilyraBotClient", guild: discord.Guild, *, force_repost: bool, dirty_leaderboard: bool, dirty_quicklinks: bool) -> str:
     db = client.db
     channel = await get_dashboard_channel(guild)
@@ -1030,6 +1151,7 @@ async def run_initialize_refresh(client: "VilyraBotClient", guild: discord.Guild
     channel = await get_dashboard_channel(guild)
     if not channel:
         return "Initialize failed: dashboard channel not found."
+    await delete_tracked_dashboard_messages(client, guild)
     await db.clear_character_message_entries_for_guild(guild.id)
     await db.clear_dashboard_meta(guild.id)
 
@@ -1093,7 +1215,7 @@ async def run_maintenance_refresh(client: "VilyraBotClient", guild: discord.Guil
 
 
 async def refresh_character_and_schedule_nav(client: "VilyraBotClient", guild: discord.Guild, character_id: int, *, dirty_leaderboard: bool, dirty_quicklinks: bool, structural_rebuild: bool = False) -> str:
-    status = await refresh_character_embed(client, guild, character_id)
+    status = await refresh_character_embed(client, guild, character_id, allow_recreate=False)
     if dirty_leaderboard or dirty_quicklinks or structural_rebuild:
         client.mark_navigation_dirty(guild.id, dirty_leaderboard=dirty_leaderboard, dirty_quicklinks=dirty_quicklinks, force_repost=structural_rebuild)
         client.ensure_navigation_rebuild(guild)
@@ -1335,7 +1457,7 @@ async def set_char_kingdom(interaction: discord.Interaction, character: str, kin
         ok = await run_db(interaction.client.db.set_character_kingdom(interaction.guild.id, cid, kingdom.value), "set_character_kingdom")
         if not ok:
             raise RuntimeError("Character not found.")
-        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid), "refresh_character_embed")
+        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid, allow_recreate=False), "refresh_character_embed")
         await log_command(interaction, f"🏰 {interaction.user.mention} set kingdom for **{row['name']}** `#{cid}` → **{kingdom.value}**")
         await safe_reply(interaction, f"✅ Set **{row['name']}** to kingdom **{kingdom.value}**.")
     except Exception as e:
@@ -1359,7 +1481,7 @@ async def award_legacy(interaction: discord.Interaction, character: str, positiv
             raise ValueError("Provide positive and/or negative points.")
         await run_db(interaction.client.db.award_legacy(interaction.guild.id, cid, pos, neg), "award_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
-        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid), "refresh_character_embed")
+        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid, allow_recreate=False), "refresh_character_embed")
         await log_command(interaction, f"🏅 {interaction.user.mention} awarded legacy to **{st['name']}** `#{cid}`: +{pos}/-{neg}")
         await safe_reply(interaction, f"✅ Awarded **{st['name']}**: +{pos}/-{neg}.")
     except Exception as e:
@@ -1426,7 +1548,7 @@ async def ability_rename(interaction: discord.Interaction, character: str, abili
         if not ok:
             raise RuntimeError("Ability not found.")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
-        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid), "refresh_character_embed")
+        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid, allow_recreate=False), "refresh_character_embed")
         await log_command(interaction, f"✏️ {interaction.user.mention} renamed ability on **{st['name']}** `#{cid}`: **{ability}** → **{new_ability_name.strip()}**")
         await safe_reply(interaction, f"✅ Renamed ability **{ability}** → **{new_ability_name.strip()}** for **{st['name']}**.")
     except Exception as e:
@@ -1466,7 +1588,7 @@ async def set_available_legacy(interaction: discord.Interaction, character: str,
         cid, _ = await resolve_character(interaction, character)
         await run_db(interaction.client.db.set_available_legacy(interaction.guild.id, cid, positive, negative), "set_available_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
-        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid), "refresh_character_embed")
+        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid, allow_recreate=False), "refresh_character_embed")
         await log_command(interaction, f"🧮 {interaction.user.mention} set AVAILABLE legacy for **{st['name']}** `#{cid}` to +{positive}/-{negative}")
         await safe_reply(interaction, f"✅ Set available legacy for **{st['name']}** to +{positive}/-{negative}.")
     except Exception as e:
@@ -1486,7 +1608,7 @@ async def set_lifetime_legacy(interaction: discord.Interaction, character: str, 
         cid, _ = await resolve_character(interaction, character)
         await run_db(interaction.client.db.set_lifetime_legacy(interaction.guild.id, cid, positive, negative), "set_lifetime_legacy")
         st = await run_db(interaction.client.db.get_character_state(interaction.guild.id, cid), "get_character_state")
-        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid), "refresh_character_embed")
+        await run_db(refresh_character_embed(interaction.client, interaction.guild, cid, allow_recreate=False), "refresh_character_embed")
         await log_command(interaction, f"📈 {interaction.user.mention} set LIFETIME legacy for **{st['name']}** `#{cid}` to +{positive}/-{negative}")
         await safe_reply(interaction, f"✅ Set lifetime legacy for **{st['name']}** to +{positive}/-{negative}.")
     except Exception as e:
@@ -1628,7 +1750,7 @@ class VilyraBotClient(discord.Client):
             chars = await self.db.list_active_characters_for_user(after.guild.id, after.id)
             for row in chars:
                 try:
-                    await refresh_character_embed(self, after.guild, int(row["character_id"]))
+                    await refresh_character_embed(self, after.guild, int(row["character_id"]), allow_recreate=False)
                 except Exception:
                     LOG.exception("Failed to refresh character embed after nickname change for character_id=%s", row.get("character_id"))
         except Exception:
